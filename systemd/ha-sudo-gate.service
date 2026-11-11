@@ -1,0 +1,32 @@
+[Unit]
+Description=Home Assistant Out-of-Band Gate Daemon
+Documentation=https://github.com/Locknes/ha-oob-gate
+After=network.target network-online.target firewalld.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/ha-sudo/ha_sudo_gate.py --daemon
+Restart=always
+RestartSec=5s
+
+# Process Execution & Sandboxing
+User=root
+Group=root
+RuntimeDirectory=ha-sudo
+RuntimeDirectoryMode=0755
+ConfigurationDirectory=ha-sudo
+ConfigurationDirectoryMode=0700
+
+# Security Hardening (KillMode=control-group ensures no background process persistence)
+PrivateTmp=true
+NoNewPrivileges=false
+KillMode=control-group
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ha-sudo-daemon
+
+[Install]
+WantedBy=multi-user.target

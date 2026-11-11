@@ -1,0 +1,407 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jit-system
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+# ==============================================================================
+# 0. GUARDRAILS PARAMETER CONFIGMAP (Cluster-Specific Overrides)
+# ==============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jit-guardrails-config
+  namespace: jit-system
+data:
+  # Optional comma-separated standing ServiceAccounts subject to JIT guardrails
+  # alongside ephemeral `system:serviceaccount:jit-system:jit-oob-*` identities.
+  callerServiceAccounts: ""
+  # Prefix for ephemeral JIT ServiceAccounts minted by ha-oob-gate
+  jitServiceAccountPrefix: "system:serviceaccount:jit-system:jit-oob-"
+  # Optional comma-separated additional protected namespaces
+  extraProtectedNamespaces: "cert-manager"
+  # Optional comma-separated allowed hostPath volume paths (empty = all hostPath volumes denied)
+  allowedHostPaths: ""
+  # Set to "true" only if JIT storage operators are explicitly permitted to create/modify cluster-scoped PVs
+  allowPersistentVolumeCreate: "false"
+---
+# ==============================================================================
+# 1. API-SERVER-LEVEL GUARDRAILS (ValidatingAdmissionPolicy - Kubernetes v1.30+ CEL)
+# ==============================================================================
+# Enforced directly by kube-apiserver on mutating/connect requests (CREATE,
+# UPDATE, DELETE, CONNECT) made by ephemeral JIT ServiceAccounts (`jit-oob-*`)
+# or any standing ServiceAccounts listed in `ConfigMap/jit-guardrails-config`.
+# Even when elevated, a governed caller CANNOT:
+#   - Modify RBAC (Roles, ClusterRoles, RoleBindings, ClusterRoleBindings)
+#   - Create/modify ServiceAccounts, Namespaces (PSA labels), or Nodes
+#   - Modify ValidatingAdmissionPolicies or Mutating/ValidatingWebhooks
+#   - Touch protected control-plane/system namespaces (`jit-system`, `kube-*`, etc.)
+#   - Exec/attach/port-forward/proxy into pods or inject ephemeralContainers
+#   - Create/update Pods or workload templates with privileged settings, host namespaces,
+#     non-default ServiceAccounts, Secret mounts/env, or disallowed hostPath volumes
+# ==============================================================================
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: jit-security-guardrails
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["*"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE", "CONNECT"]
+        resources: ["*/*"]
+  variables:
+    - name: jitPrefix
+      expression: >-
+        params != null && has(params.data) && "jitServiceAccountPrefix" in params.data && params.data["jitServiceAccountPrefix"].trim() != ""
+        ? params.data["jitServiceAccountPrefix"].trim()
+        : "system:serviceaccount:jit-system:jit-oob-"
+    - name: callerSAs
+      expression: >-
+        params != null && has(params.data) && "callerServiceAccounts" in params.data && params.data["callerServiceAccounts"].trim() != ""
+        ? params.data["callerServiceAccounts"].split(",").map(s, s.trim())
+        : []
+    - name: isGovernedCaller
+      expression: >-
+        request.userInfo.username.startsWith(variables.jitPrefix) ||
+        request.userInfo.username in variables.callerSAs
+    - name: extraProtectedNs
+      expression: >-
+        params != null && has(params.data) && "extraProtectedNamespaces" in params.data && params.data["extraProtectedNamespaces"].trim() != ""
+        ? params.data["extraProtectedNamespaces"].split(",").map(s, s.trim())
+        : []
+    - name: allowedHostPaths
+      expression: >-
+        params != null && has(params.data) && "allowedHostPaths" in params.data && params.data["allowedHostPaths"].trim() != ""
+        ? params.data["allowedHostPaths"].split(",").map(s, s.trim())
+        : []
+    - name: allowPVCreate
+      expression: >-
+        params != null && has(params.data) && "allowPersistentVolumeCreate" in params.data &&
+        params.data["allowPersistentVolumeCreate"].trim().lowerAscii() == "true"
+    - name: podSpec
+      expression: >-
+        request.operation == "DELETE" || request.?subResource.orValue("") in ["status", "scale", "log"]
+        ? null
+        : request.resource.resource == "pods"
+          ? object.spec
+          : request.resource.resource in ["deployments", "daemonsets", "statefulsets", "replicasets", "replicationcontrollers", "jobs"]
+            ? object.spec.template.spec
+            : request.resource.resource == "podtemplates"
+              ? object.template.spec
+              : request.resource.resource == "cronjobs"
+                ? object.spec.jobTemplate.spec.template.spec
+                : null
+    - name: allContainers
+      expression: >-
+        variables.podSpec == null
+        ? []
+        : variables.podSpec.containers + variables.podSpec.?initContainers.orValue([])
+  validations:
+    # 1. Never allow touching protected system namespaces
+    - expression: >-
+        !variables.isGovernedCaller ||
+        (
+          !(request.?namespace.orValue("") in ["jit-system", "kube-system", "kube-public", "kube-node-lease"]) &&
+          !(request.?namespace.orValue("") in variables.extraProtectedNs)
+        )
+      message: "JIT Guardrail: Modifying resources in protected control-plane/system namespaces is forbidden."
+
+    # 2. Never allow modifying RBAC, ServiceAccounts, Namespaces, Nodes, or Admission Policies
+    - expression: >-
+        !variables.isGovernedCaller ||
+        (
+          !(request.resource.group == "rbac.authorization.k8s.io") &&
+          !(request.resource.group == "admissionregistration.k8s.io") &&
+          !(request.resource.group == "" && request.resource.resource in ["serviceaccounts", "namespaces", "nodes"])
+        )
+      message: "JIT Guardrail: Modifying RBAC, ServiceAccounts, Namespaces, Nodes, or Admission Policies is forbidden to prevent privilege persistence."
+
+    # 3. Block all CONNECT operations (exec/attach/portforward/proxy) and ephemeralContainers into pods
+    - expression: >-
+        !variables.isGovernedCaller ||
+        !(request.operation == "CONNECT" || request.?subResource.orValue("") in ["exec", "attach", "portforward", "proxy", "ephemeralcontainers"])
+      message: "JIT Guardrail: Executing, attaching, port-forwarding, or injecting ephemeral containers into pods is forbidden."
+
+    # 4. Enforce single deduplicated PodSpec security invariants across Pods, Deployments, DaemonSets, StatefulSets, Jobs, CronJobs, and PodTemplates
+    - expression: >-
+        !variables.isGovernedCaller ||
+        variables.podSpec == null ||
+        (
+          variables.podSpec.?hostPID.orValue(false) == false &&
+          variables.podSpec.?hostIPC.orValue(false) == false &&
+          variables.podSpec.?hostNetwork.orValue(false) == false &&
+          variables.podSpec.?hostUsers.orValue(true) == true &&
+          variables.podSpec.?hostAliases.orValue([]).size() == 0 &&
+          variables.podSpec.?serviceAccountName.orValue("default") in ["", "default"] &&
+          variables.podSpec.?serviceAccount.orValue("default") in ["", "default"] &&
+          variables.podSpec.?securityContext.?seccompProfile.?type.orValue("RuntimeDefault") != "Unconfined" &&
+          variables.podSpec.?securityContext.?appArmorProfile.?type.orValue("RuntimeDefault") != "Unconfined" &&
+          !has(variables.podSpec.?securityContext.seLinuxOptions) &&
+          variables.podSpec.?ephemeralContainers.orValue([]).size() == 0 &&
+          variables.allContainers.all(c,
+            c.?securityContext.?privileged.orValue(false) == false &&
+            c.?securityContext.?capabilities.?add.orValue([]).size() == 0 &&
+            c.?securityContext.?procMount.orValue("Default") == "Default" &&
+            c.?securityContext.?seccompProfile.?type.orValue("RuntimeDefault") != "Unconfined" &&
+            c.?securityContext.?appArmorProfile.?type.orValue("RuntimeDefault") != "Unconfined" &&
+            !has(c.?securityContext.seLinuxOptions) &&
+            c.?ports.orValue([]).all(p, p.?hostPort.orValue(0) == 0) &&
+            c.?envFrom.orValue([]).all(ef, !has(ef.secretRef)) &&
+            c.?env.orValue([]).all(e, !has(e.?valueFrom.secretKeyRef))
+          ) &&
+          variables.podSpec.?volumes.orValue([]).all(v,
+            (!has(v.hostPath) || v.hostPath.path in variables.allowedHostPaths) &&
+            !has(v.secret) &&
+            !has(v.persistentVolumeClaim) &&
+            (!has(v.projected) || v.projected.?sources.orValue([]).all(s, !has(s.serviceAccountToken) && !has(s.secret)))
+          )
+        )
+      message: "JIT Guardrail: Workloads may not use privileged: true, hostPID/hostIPC/hostNetwork: true, hostPort, hostAliases, added Linux capabilities, Unconfined seccomp/AppArmor/procMount/seLinuxOptions, ephemeralContainers, non-default ServiceAccounts, Secret/PVC mounts, or unapproved hostPath volumes."
+
+    # 5. Block cluster-scoped PersistentVolume creation/modification unless explicitly enabled in jit-guardrails-config (never allow hostPath/local PVs)
+    - expression: >-
+        !variables.isGovernedCaller ||
+        request.resource.resource != "persistentvolumes" ||
+        request.operation == "DELETE" ||
+        (
+          variables.allowPVCreate &&
+          !has(object.spec.hostPath) &&
+          !("local" in object.spec) &&
+          object.spec.?persistentVolumeReclaimPolicy.orValue("Retain") == "Retain"
+        )
+      message: "JIT Guardrail: Creating or modifying cluster-scoped PersistentVolumes is disabled in jit-guardrails-config (or uses forbidden hostPath/local storage)."
+
+    # 6. Block Service externalIPs hijacking by governed callers
+    - expression: >-
+        !variables.isGovernedCaller ||
+        request.resource.resource != "services" ||
+        request.operation == "DELETE" ||
+        object.spec.?externalIPs.orValue([]).size() == 0
+      message: "JIT Guardrail: Services may not specify externalIPs to prevent cluster/LAN traffic interception."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: jit-security-guardrails-binding
+spec:
+  policyName: jit-security-guardrails
+  paramRef:
+    name: jit-guardrails-config
+    namespace: jit-system
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+---
+# ==============================================================================
+# 2. CUSTOM LEAST-PRIVILEGE JIT ROLES (No RBAC-write or system Secret-read)
+# ==============================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jit-workload-operator
+rules:
+  - apiGroups: ["", "apps", "batch", "networking.k8s.io"]
+    resources:
+      - deployments
+      - deployments/scale
+      - deployments/rollback
+      - daemonsets
+      - statefulsets
+      - statefulsets/scale
+      - replicasets
+      - pods
+      - pods/log
+      - pods/status
+      - services
+      - ingresses
+      - networkpolicies
+      - configmaps
+      - persistentvolumeclaims
+      - jobs
+      - cronjobs
+      - events
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jit-storage-operator
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "volumeattachments"]
+    verbs: ["get", "list", "watch"]
+---
+# ==============================================================================
+# 3. BROKER SERVICE ACCOUNT, TOKEN SECRET & SCOPED RBAC (No cluster-admin!)
+# ==============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jit-elevation-broker
+  namespace: jit-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: jit-elevation-broker-token
+  namespace: jit-system
+  annotations:
+    kubernetes.io/service-account.name: jit-elevation-broker
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jit-broker-ns-role
+  namespace: jit-system
+rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts", "serviceaccounts/token"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: jit-broker-ns-binding
+  namespace: jit-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: jit-broker-ns-role
+subjects:
+  - kind: ServiceAccount
+    name: jit-elevation-broker
+    namespace: jit-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jit-elevation-broker-cluster-role
+rules:
+  # Validate remote caller identity on POST /v1/request via TokenReview
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  # Create/delete temporary RoleBindings and ClusterRoleBindings
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings", "clusterrolebindings"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # Explicit 'bind' permission ONLY for allowlisted ClusterRoles
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["bind"]
+    resourceNames:
+      - "view"
+      - "jit-workload-operator"
+      - "jit-storage-operator"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jit-elevation-broker-cluster-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: jit-elevation-broker-cluster-role
+subjects:
+  - kind: ServiceAccount
+    name: jit-elevation-broker
+    namespace: jit-system
+---
+# ==============================================================================
+# 4. FAIL-SAFE INDEPENDENT CRONJOB SWEEPER (Purges expired leases every 5m)
+# ==============================================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: jit-orphan-sweeper
+  namespace: jit-system
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: jit-elevation-broker
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: sweeper
+              image: python:3.12-alpine
+              command:
+                - python3
+                - -c
+                - |
+                  import json, ssl, time, urllib.request, urllib.error
+
+                  SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+                  with open(f"{SA_DIR}/token") as f:
+                      TOKEN = f.read().strip()
+                  CTX = ssl.create_default_context(cafile=f"{SA_DIR}/ca.crt")
+                  API = "https://kubernetes.default.svc"
+
+                  def k8s_req(method, path):
+                      req = urllib.request.Request(f"{API}{path}", method=method)
+                      req.add_header("Authorization", f"Bearer {TOKEN}")
+                      req.add_header("Accept", "application/json")
+                      try:
+                          with urllib.request.urlopen(req, context=CTX, timeout=10) as r:
+                              raw = r.read().decode("utf-8")
+                              return json.loads(raw) if raw else {}
+                      except urllib.error.HTTPError as e:
+                          if method == "DELETE" and e.code == 404:
+                              return {}
+                          raise
+
+                  now_ts = int(time.time())
+                  for ep, kind, ns_scoped in [
+                      ("/apis/rbac.authorization.k8s.io/v1/rolebindings?labelSelector=oob.gate/managed%3Dtrue", "rolebindings", True),
+                      ("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings?labelSelector=oob.gate/managed%3Dtrue", "clusterrolebindings", False),
+                      ("/api/v1/namespaces/jit-system/serviceaccounts?labelSelector=oob.gate/managed%3Dtrue", "serviceaccounts", True),
+                  ]:
+                      items = k8s_req("GET", ep).get("items", [])
+                      for it in items:
+                          name = it["metadata"]["name"]
+                          ns = it["metadata"].get("namespace", "jit-system")
+                          exp = int(it["metadata"].get("annotations", {}).get("oob.gate/expires-at", "0") or "0")
+                          if now_ts >= exp:
+                              del_path = (
+                                  f"/api/v1/namespaces/{ns}/serviceaccounts/{name}" if kind == "serviceaccounts"
+                                  else f"/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings/{name}" if ns_scoped
+                                  else f"/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{name}"
+                              )
+                              try:
+                                  k8s_req("DELETE", del_path)
+                                  print(f"[Sweeper] Purged expired {kind}/{name}")
+                              except Exception as e:
+                                  print(f"[Sweeper] Error purging {kind}/{name}: {e}")
+              securityContext:
+                allowPrivilegeEscalation: false
+                privileged: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL

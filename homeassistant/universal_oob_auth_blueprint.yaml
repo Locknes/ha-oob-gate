@@ -1,0 +1,405 @@
+blueprint:
+  name: "Universal Out-of-Band (OOB) Privileged Auth & Sudo Gate"
+  description: >-
+    Universal actionable mobile notification gate for ha-oob-gate modules
+    (Linux PAM sudo, SHA-256-pinned sudo_batch, GitHub token checkout, SSH ForceCommand,
+    Kubernetes JIT tokens, Home Assistant API proxy, secret checkout, and generic
+    human-in-the-loop approvals).
+
+    Android Companion Features Included:
+      - Per-Machine Notification Channels (`OOB: <hostname>`) & Grouping (`oob_<hostname>`)
+      - True Un-Swipeable Pending State (`persistent: true`, `sticky: true`, `clickAction: noAction`, plus automatic re-pinning on `mobile_app_notification_cleared` if swiped on Android 14+)
+      - Live Countdown Timer (`chronometer: true`, `when_relative: true`) in notification header
+      - Dynamic Material Design Icons (`notification_icon`) & Accent Colors (`color`) per module
+      - Instant `clear_notification` on Approve; silent in-place replacement (`alert_once: true`, swipeable) on Deny or Timeout
+
+    Prerequisite in configuration.yaml:
+      rest_command:
+        oob_gate_callback:
+          url: "{{ callback_scheme | default('https') }}://{{ callback_host }}:{{ callback_port }}/{{ action }}"
+          method: POST
+          content_type: "application/json"
+          headers:
+            X-HA-Approval-Token: !secret ha_oob_approval_token
+          payload: '{"request_id": "{{ request_id }}", "nonce": "{{ nonce }}", "action": "{{ action }}"}'
+  domain: automation
+  source_url: https://github.com/Locknes/ha-oob-gate/blob/main/homeassistant/universal_oob_auth_blueprint.yaml
+  input:
+    notify_service:
+      name: "Notification Service"
+      description: "Target Home Assistant mobile_app notification service (e.g., notify.mobile_app_pixel)"
+      default: "notify.notify"
+      selector:
+        text: {}
+    webhook_id:
+      name: "Webhook ID"
+      description: "Secret Webhook ID configured in your ha-oob-gate daemon (/etc/ha-sudo/config.json or K8s Secret)"
+      default: ""
+      selector:
+        text: {}
+    callback_service:
+      name: "Callback REST Command Service"
+      description: "The rest_command service that POSTs {request_id, nonce, action} back to callback_host:callback_port"
+      default: "rest_command.oob_gate_callback"
+      selector:
+        text: {}
+    timeout_minutes:
+      name: "Fallback Approval Timeout (Minutes)"
+      description: "Default minutes to wait for mobile approval if the incoming webhook payload does not specify a timeout"
+      default: 15
+      selector:
+        number:
+          min: 1
+          max: 30
+          unit_of_measurement: minutes
+    allowed_callback_hosts:
+      name: "Allowed Callback Hosts (Comma-Separated)"
+      description: "Comma-separated allowlist of trusted ha-oob-gate callback IPs/hostnames to prevent SSRF"
+      default: "192.0.2.20,oob-gate.example.com"
+      selector:
+        text: {}
+    allowed_approver_user_id:
+      name: "Allowed Approver Home Assistant User ID"
+      description: "Strongly recommended: lock mobile approval events to your human Home Assistant User ID (context.user_id). When set, any event with a missing, null, or mismatched context.user_id is ignored."
+      default: ""
+      selector:
+        text: {}
+    allowed_device_id:
+      name: "Allowed Mobile Device ID (Optional)"
+      description: "Lock mobile approval events to your specific mobile device_id"
+      default: ""
+      selector:
+        text: {}
+
+mode: parallel
+max: 10
+
+variables:
+  raw_target: !input notify_service
+  callback_cmd: !input callback_service
+  timeout_mins: !input timeout_minutes
+  allowed_hosts_raw: !input allowed_callback_hosts
+  allowed_user_id: !input allowed_approver_user_id
+  allowed_dev_id: !input allowed_device_id
+  notify_action: >-
+    {%- set t = (raw_target | default('notify.notify', true)) | trim -%}
+    {%- if not t.startswith('notify.') and '.' not in t -%}
+      notify.{{ t }}
+    {%- else -%}
+      {{ t }}
+    {%- endif -%}
+  req_id: "{{ trigger.json.request_id }}"
+  nonce: "{{ trigger.json.nonce }}"
+  approve_nonce: "{{ trigger.json.approve_nonce | default(trigger.json.nonce) }}"
+  deny_nonce: "{{ trigger.json.deny_nonce | default(trigger.json.nonce) }}"
+  module_name: "{{ trigger.json.module | default('pam_sudo') }}"
+  verify_code: "{{ trigger.json.verify_code | default('') }}"
+  h_name: "{{ trigger.json.hostname | default('host') }}"
+  target_user: "{{ trigger.json.user | default('user') }}"
+  cmd: "{{ trigger.json.command | default('unspecified command') }}"
+  cwd: "{{ trigger.json.cwd | default('unknown') }}"
+  proc: "{{ trigger.json.parent_process | default('unknown') }}"
+  pid: "{{ trigger.json.pid | default('') }}"
+  cb_scheme: "{{ (trigger.json.callback_scheme | default('https')) | string | trim | lower }}"
+  cb_host: "{{ trigger.json.callback_host | default('') | trim }}"
+  cb_port: "{{ (trigger.json.callback_port | default('8443')) | string | trim }}"
+  allowed_hosts: "{{ (allowed_hosts_raw | default('192.0.2.20', true)).split(',') | map('trim') | list }}"
+  expected_user_id: "{{ (allowed_user_id | default('', true)) | string | trim }}"
+  expected_dev_id: "{{ (allowed_dev_id | default('', true)) | string | trim }}"
+
+  notif_tag: "{{ trigger.json.tag | default('oob_' ~ req_id) }}"
+  notif_channel: "{{ trigger.json.channel | default('OOB: ' ~ h_name) }}"
+  notif_group: "{{ trigger.json.group | default('oob_' ~ h_name) }}"
+  timeout_secs: "{{ (trigger.json.timeout | default(timeout_mins * 60, true)) | int }}"
+  deadline_ts: "{{ (now().timestamp() + (timeout_secs | int)) | int }}"
+
+  notif_icon: >-
+    {%- if trigger.json.icon is defined and trigger.json.icon -%}
+      {{ trigger.json.icon | trim }}
+    {%- elif module_name == 'github_token' -%}
+      mdi:github
+    {%- elif module_name == 'k8s_token' -%}
+      mdi:kubernetes
+    {%- elif module_name == 'ssh_gate' -%}
+      mdi:console-network
+    {%- elif module_name == 'secret_checkout' -%}
+      mdi:key-variant
+    {%- elif module_name == 'sudo_batch' -%}
+      mdi:script-text-key-outline
+    {%- elif module_name == 'ha_api' -%}
+      mdi:home-assistant
+    {%- elif module_name == 'generic_confirm' -%}
+      mdi:check-decagram
+    {%- else -%}
+      mdi:shield-lock
+    {%- endif -%}
+  notif_color: >-
+    {%- if trigger.json.color is defined and trigger.json.color -%}
+      {{ trigger.json.color | trim }}
+    {%- elif module_name == 'github_token' -%}
+      {{ '#8B5CF6' }}
+    {%- elif module_name == 'k8s_token' -%}
+      {{ '#326CE5' }}
+    {%- elif module_name == 'ssh_gate' -%}
+      {{ '#06B6D4' }}
+    {%- elif module_name == 'secret_checkout' -%}
+      {{ '#EAB308' }}
+    {%- elif module_name == 'ha_api' -%}
+      {{ '#03A9F4' }}
+    {%- elif module_name == 'generic_confirm' -%}
+      {{ '#10B981' }}
+    {%- else -%}
+      {{ '#F59E0B' }}
+    {%- endif -%}
+
+  notif_title: >-
+    {%- if trigger.json.title is defined and trigger.json.title -%}
+      {{ trigger.json.title }}
+    {%- else -%}
+      🚨 Sudo Requested: {{ h_name }}{% if verify_code %} [{{ verify_code }}]{% endif %}
+    {%- endif -%}
+  notif_message: >-
+    {%- if trigger.json.message is defined and trigger.json.message -%}
+      {{ trigger.json.message }}
+    {%- else -%}
+      Host: {{ h_name }}
+      User: {{ target_user }}
+      Process: {{ proc }}{% if pid %} (PID: {{ pid }}){% endif %}
+      Directory: {{ cwd }}
+
+      Command:
+      {{ cmd }}
+    {%- endif -%}
+  approve_btn_title: >-
+    {%- if trigger.json.approve_title is defined and trigger.json.approve_title -%}
+      {{ trigger.json.approve_title }}
+    {%- elif verify_code -%}
+      Approve [{{ verify_code }}]
+    {%- else -%}
+      Approve
+    {%- endif -%}
+  deny_btn_title: "{{ trigger.json.deny_title | default('Deny') }}"
+  denied_title: "{{ trigger.json.denied_title | default('❌ Denied: ' ~ h_name) }}"
+  denied_message: "{{ trigger.json.denied_message | default('Rejected (' ~ module_name ~ '): ' ~ cmd) }}"
+  timeout_title: "{{ trigger.json.timeout_title | default('⏱️ Timed Out: ' ~ h_name) }}"
+  timeout_message: "{{ trigger.json.timeout_message | default('Expired with no response (' ~ module_name ~ '): ' ~ cmd) }}"
+
+triggers:
+  - trigger: webhook
+    webhook_id: !input webhook_id
+    allowed_methods:
+      - POST
+    local_only: true
+
+actions:
+  - condition: template
+    value_template: "{{ not (trigger.json.test | default(false)) }}"
+
+  - if:
+      - condition: template
+        value_template: "{{ (trigger.json.clear | default(false)) == true }}"
+    then:
+      - event: oob_request_cancelled
+        event_data:
+          request_id: "{{ req_id }}"
+      - action: "{{ notify_action }}"
+        data:
+          message: "clear_notification"
+          data:
+            tag: "{{ notif_tag }}"
+      - stop: "Cleared cancelled OOB notification"
+
+  - condition: template
+    value_template: "{{ cb_scheme in ['https', 'http'] and cb_host in allowed_hosts and cb_port in ['8443', '8080'] }}"
+
+  - repeat:
+      sequence:
+        - variables:
+            remaining_secs: "{{ [1, (deadline_ts | int) - (now().timestamp() | int)] | max }}"
+
+        - action: "{{ notify_action }}"
+          data:
+            title: "{{ notif_title }}"
+            message: "{{ notif_message }}"
+            data:
+              tag: "{{ notif_tag }}"
+              channel: "{{ notif_channel }}"
+              importance: high
+              priority: high
+              ttl: 0
+              alert_once: "{{ repeat.index > 1 }}"
+              persistent: true
+              sticky: true
+              live_update: true
+              critical_text: "{{ verify_code if verify_code else 'OOB' }}"
+              clickAction: "noAction"
+              url: "noAction"
+              chronometer: true
+              when: "{{ remaining_secs }}"
+              when_relative: true
+              notification_icon: "{{ notif_icon }}"
+              color: "{{ notif_color }}"
+              actions:
+                - action: "APPROVE_OOB_{{ approve_nonce[:24] }}"
+                  title: "{{ approve_btn_title }}"
+                  destructive: false
+                - action: "DENY_OOB_{{ deny_nonce[:24] }}"
+                  title: "{{ deny_btn_title }}"
+                  destructive: true
+
+        - wait_for_trigger:
+            - trigger: event
+              event_type: mobile_app_notification_action
+              event_data:
+                action: "APPROVE_OOB_{{ approve_nonce[:24] }}"
+            - trigger: event
+              event_type: mobile_app_notification_action
+              event_data:
+                action: "DENY_OOB_{{ deny_nonce[:24] }}"
+            - trigger: event
+              event_type: oob_request_cancelled
+              event_data:
+                request_id: "{{ req_id }}"
+            - trigger: event
+              event_type: mobile_app_notification_cleared
+              event_data:
+                tag: "{{ notif_tag }}"
+          timeout:
+            seconds: "{{ remaining_secs }}"
+          continue_on_timeout: true
+
+      until:
+        - condition: template
+          value_template: >-
+            {{ wait.trigger is none
+               or wait.trigger.event.event_type == 'oob_request_cancelled'
+               or (
+                 wait.trigger.event.event_type == 'mobile_app_notification_action'
+                 and (
+                   expected_user_id == ''
+                   or (
+                     wait.trigger.context is defined
+                     and wait.trigger.context is not none
+                     and wait.trigger.context.user_id is defined
+                     and wait.trigger.context.user_id is not none
+                     and (wait.trigger.context.user_id | string | trim) != ''
+                     and (wait.trigger.context.user_id | string | trim) == expected_user_id
+                   )
+                 )
+                 and (expected_dev_id == '' or (wait.trigger.event.data.device_id | default('')) == expected_dev_id)
+               )
+               or (now().timestamp() | int) >= (deadline_ts | int) }}
+
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ wait.trigger is not none
+                 and wait.trigger.event.event_type == 'oob_request_cancelled' }}
+        sequence:
+          - action: "{{ notify_action }}"
+            data:
+              message: "clear_notification"
+              data:
+                tag: "{{ notif_tag }}"
+
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ wait.trigger is not none
+                 and wait.trigger.event.event_type == 'mobile_app_notification_action'
+                 and wait.trigger.event.data.action == 'APPROVE_OOB_' ~ approve_nonce[:24]
+                 and (
+                   expected_user_id == ''
+                   or (
+                     wait.trigger.context is defined
+                     and wait.trigger.context is not none
+                     and wait.trigger.context.user_id is defined
+                     and wait.trigger.context.user_id is not none
+                     and (wait.trigger.context.user_id | string | trim) != ''
+                     and (wait.trigger.context.user_id | string | trim) == expected_user_id
+                   )
+                 )
+                 and (expected_dev_id == '' or (wait.trigger.event.data.device_id | default('')) == expected_dev_id) }}
+        sequence:
+          - action: "{{ callback_cmd }}"
+            data:
+              callback_scheme: "{{ cb_scheme }}"
+              callback_host: "{{ cb_host }}"
+              callback_port: "{{ cb_port }}"
+              request_id: "{{ req_id }}"
+              nonce: "{{ approve_nonce }}"
+              action: "approve"
+          - action: "{{ notify_action }}"
+            data:
+              message: "clear_notification"
+              data:
+                tag: "{{ notif_tag }}"
+
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ wait.trigger is not none
+                 and wait.trigger.event.event_type == 'mobile_app_notification_action'
+                 and wait.trigger.event.data.action == 'DENY_OOB_' ~ deny_nonce[:24]
+                 and (
+                   expected_user_id == ''
+                   or (
+                     wait.trigger.context is defined
+                     and wait.trigger.context is not none
+                     and wait.trigger.context.user_id is defined
+                     and wait.trigger.context.user_id is not none
+                     and (wait.trigger.context.user_id | string | trim) != ''
+                     and (wait.trigger.context.user_id | string | trim) == expected_user_id
+                   )
+                 )
+                 and (expected_dev_id == '' or (wait.trigger.event.data.device_id | default('')) == expected_dev_id) }}
+        sequence:
+          - action: "{{ callback_cmd }}"
+            data:
+              callback_scheme: "{{ cb_scheme }}"
+              callback_host: "{{ cb_host }}"
+              callback_port: "{{ cb_port }}"
+              request_id: "{{ req_id }}"
+              nonce: "{{ deny_nonce }}"
+              action: "deny"
+          - action: "{{ notify_action }}"
+            data:
+              title: "{{ denied_title }}"
+              message: "{{ denied_message }}"
+              data:
+                tag: "{{ notif_tag }}"
+                channel: "{{ notif_channel }}"
+                alert_once: true
+                persistent: false
+                sticky: false
+                chronometer: false
+                clickAction: "noAction"
+                url: "noAction"
+                notification_icon: "mdi:shield-alert"
+                color: "#EF4444"
+
+    default:
+      - action: "{{ callback_cmd }}"
+        data:
+          callback_scheme: "{{ cb_scheme }}"
+          callback_host: "{{ cb_host }}"
+          callback_port: "{{ cb_port }}"
+          request_id: "{{ req_id }}"
+          nonce: "{{ deny_nonce }}"
+          action: "deny"
+      - action: "{{ notify_action }}"
+        data:
+          title: "{{ timeout_title }}"
+          message: "{{ timeout_message }}"
+          data:
+            tag: "{{ notif_tag }}"
+            channel: "{{ notif_channel }}"
+            alert_once: true
+            persistent: false
+            sticky: false
+            chronometer: false
+            clickAction: "noAction"
+            url: "noAction"
+            notification_icon: "mdi:timer-off-outline"
+            color: "#6B7280"

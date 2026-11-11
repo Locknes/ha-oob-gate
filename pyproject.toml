@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ha-oob-gate"
+version = "5.0.0"
+description = "Zero-Trust Out-of-Band (OOB) Authorization, PAM 2FA, Kubernetes JIT & MCP Gateway for Home Assistant Actionable Notifications"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+  {name = "Locknes"}
+]
+keywords = [
+  "home-assistant",
+  "zero-trust",
+  "pam",
+  "sudo",
+  "kubernetes",
+  "jit",
+  "mcp",
+  "ai-agents",
+  "out-of-band-auth",
+  "2fa"
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Environment :: No Input/Output (Daemon)",
+  "Intended Audience :: System Administrators",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+  "Topic :: System :: Systems Administration :: Authentication/Directory :: PAM"
+]
+dependencies = []
+
+[project.scripts]
+oob-auth = "ha_oob_gate.cli:main"
+ha-oob-gate = "ha_oob_gate.cli:main"
+ha-sudo-gate = "ha_oob_gate.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ha_oob_gate*"]

@@ -1,0 +1,49 @@
+{
+  "ha_url": "https://homeassistant.example.com",
+  "ha_trusted_ip": "192.0.2.10",
+  "ha_approval_token": "REPLACE_WITH_256_BIT_HEX_APPROVAL_TOKEN",
+  "webhook_id": "REPLACE_WITH_YOUR_RANDOM_HEX_WEBHOOK_ID",
+  "callback_host": "192.0.2.20",
+  "listen_port": 8443,
+  "tls_enabled": true,
+  "tls_cert_path": "/etc/ha-sudo/tls.crt",
+  "tls_key_path": "/etc/ha-sudo/tls.key",
+  "timeout_seconds": 900,
+  "hmac_key_path": "/etc/ha-sudo/hmac.key",
+  "ticket_dir": "/run/ha-sudo",
+  "socket_path": "/run/ha-sudo/daemon.sock",
+  "vault_path": "/etc/ha-sudo/vault.json",
+  "audit_log_path": "/var/log/ha-oob-gate/audit.jsonl",
+  "ha_admin_token_path": "/etc/ha-sudo/secrets/ha_admin_token",
+  "k8s_ca_path": "/etc/ha-sudo/k8s_ca.crt",
+  "enabled_modules": [
+    "pam_sudo",
+    "sudo_batch",
+    "ssh_gate",
+    "k8s_token",
+    "github_token",
+    "ha_api",
+    "generic_confirm",
+    "secret_checkout"
+  ],
+  "default_sudo_scope": "command_pinned",
+  "agent_users": [
+    "ai-agent",
+    "claude",
+    "cursor"
+  ],
+  "user_policies": {
+    "ai-agent": "deny_pam_sudo",
+    "ops_admin": "window"
+  },
+  "passwordless_pam_users": [],
+  "allowed_k8s_callers": [],
+  "module_config": {
+    "github_token": {
+      "allow_vault_pat_fallback": false,
+      "default_repo_policy": "deny"
+    }
+  },
+  "max_requests_per_10m": 6,
+  "max_auto_approvals_per_10m": 60
+}

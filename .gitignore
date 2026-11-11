@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.coverage
+*.bak*
+*.key
+*.crt
+*.ticket
+config.json
+vault.json
+.jit-*
+.env
