@@ -286,6 +286,33 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
             ws.authenticate("test-tok")
         self.assertTrue(server_seen_pong.wait(timeout=2.0))
 
+    def test_github_app_setup_and_legacy_agy_topics(self):
+        from ha_oob_gate.modules.github_token import evaluate_repo_tag_policy
+        from ha_oob_gate.setup_github_app import (
+            render_manifest_html,
+            update_github_app_config,
+            write_private_key_atomic,
+        )
+
+        # Verify both oob-* and legacy agy-* topics are honored
+        self.assertEqual(evaluate_repo_tag_policy(["agy-oob"], {}, "write")[0], "oob")
+        self.assertEqual(evaluate_repo_tag_policy(["oob-oob"], {}, "write")[0], "oob")
+        self.assertEqual(evaluate_repo_tag_policy(["agy-oob"], {}, "read")[0], "auto")
+        self.assertEqual(evaluate_repo_tag_policy(["agy-write"], {}, "write")[0], "auto")
+        self.assertEqual(evaluate_repo_tag_policy(["agy-deny", "oob-write"], {}, "write")[0], "deny")
+
+        # Verify atomic 0400 PEM write and config update with empty installation_id for multi-owner discovery
+        pem_path = Path(self.tmp_dir.name) / "secrets" / "github_app.pem"
+        cfg_path = Path(self.tmp_dir.name) / "config.json"
+        write_private_key_atomic(pem_path, "-----BEGIN RSA PRIVATE KEY-----\nMIIB...\n-----END RSA PRIVATE KEY-----")
+        self.assertEqual(pem_path.stat().st_mode & 0o777, 0o400)
+
+        cfg = update_github_app_config(cfg_path, app_id="123456", private_key_path=pem_path, default_repo_policy="oob")
+        self.assertEqual(cfg["module_config"]["github_token"]["app_id"], "123456")
+        self.assertEqual(cfg["module_config"]["github_token"]["installation_id"], "")
+        self.assertEqual(cfg["module_config"]["github_token"]["default_repo_policy"], "oob")
+        self.assertIn("https://github.com/settings/apps/new", render_manifest_html())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
