@@ -170,10 +170,11 @@ def _github_api_request(
 ) -> Tuple[int, Dict[str, Any]]:
     headers = {
         "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": f"ha-oob-gate/{__version__}",
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     body = None
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
