@@ -20,6 +20,7 @@ HOST_BROKER_TOKEN_PATH = "/etc/ha-sudo/k8s_broker.token"
 HOST_CA_PATH = "/etc/ha-sudo/k8s_ca.crt"
 FALLBACK_SYSTEM_CA_PATHS = (
     "/etc/kubernetes/pki/ca.crt",
+    "/etc/pki/ca-trust/source/anchors/k3s-ca.crt",
 )
 DEFAULT_HOST_APISERVER = os.environ.get("K8S_APISERVER_URL", "https://127.0.0.1:6443")
 
