@@ -198,12 +198,40 @@ def create_tls_context(config: Dict[str, Any]) -> ssl.SSLContext:
     return ctx
 
 
+class _DualModeTLSSocketWrapper:
+    """Socket wrapper that auto-detects TLS ClientHello (0x16) vs plain HTTP via MSG_PEEK."""
+
+    def __init__(self, raw_sock: socket.socket, ssl_ctx: ssl.SSLContext):
+        self._sock = raw_sock
+        self._ctx = ssl_ctx
+
+    def accept(self):
+        conn, addr = self._sock.accept()
+        try:
+            prev_timeout = conn.gettimeout()
+            conn.settimeout(5.0)
+            first = conn.recv(1, socket.MSG_PEEK)
+            conn.settimeout(prev_timeout)
+            if first == b"\x16":
+                return self._ctx.wrap_socket(conn, server_side=True), addr
+            return conn, addr
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+
+    def __getattr__(self, name: str):
+        return getattr(self._sock, name)
+
+
 def wrap_http_server_tls(http_server: ThreadingHTTPServer, config: Dict[str, Any]) -> bool:
-    """Wrap `ThreadingHTTPServer.socket` in TLS when `tls_enabled` is True."""
+    """Wrap `ThreadingHTTPServer.socket` in dual-mode TLS/HTTP when `tls_enabled` is True."""
     if not config.get("tls_enabled", True):
         return False
     ctx = create_tls_context(config)
-    http_server.socket = ctx.wrap_socket(http_server.socket, server_side=True)
+    http_server.socket = _DualModeTLSSocketWrapper(http_server.socket, ctx)  # type: ignore[assignment]
     return True
 
 

@@ -125,6 +125,7 @@ def update_github_app_config(
     private_key_path: Path = DEFAULT_PEM_PATH,
     default_repo_policy: str = "oob",
     allow_vault_pat_fallback: bool = True,
+    legacy_http_callback: bool = False,
 ) -> Dict[str, Any]:
     """Atomically update `module_config.github_token` in `/etc/ha-sudo/config.json`."""
     if config_path.exists():
@@ -132,6 +133,10 @@ def update_github_app_config(
             cfg = json.load(f)
     else:
         cfg = {}
+
+    if legacy_http_callback:
+        cfg["tls_enabled"] = False
+        cfg["ha_approval_token"] = ""
 
     enabled = list(cfg.get("enabled_modules") or [])
     if "github_token" not in enabled:
@@ -219,6 +224,11 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--target-pem", default=str(DEFAULT_PEM_PATH), help="Target PEM path")
     parser.add_argument("--default-policy", default="oob", choices=["deny", "read", "oob", "write"])
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help="GitHub API base URL")
+    parser.add_argument(
+        "--legacy-http-callback",
+        action="store_true",
+        help="Configure tls_enabled=false and ha_approval_token='' for Home Assistant http:// rest_command compatibility",
+    )
     parser.add_argument("--restart", action="store_true", help="Restart ha-sudo-gate.service after setup")
     args = parser.parse_args(argv)
 
@@ -228,10 +238,14 @@ def main(argv: List[str] | None = None) -> int:
         print(f"[setup-github-app] Wrote 1-click GitHub App Manifest launcher to {out_path}")
         return 0
 
+    target_pem = Path(args.target_pem)
+    config_path = Path(args.config)
+
     if args.code:
         conv = exchange_manifest_code(args.code, api_url=args.api_url)
         app_id = str(conv["id"])
         pem_text = str(conv["pem"])
+        write_private_key_atomic(target_pem, pem_text, mode=0o400)
     elif args.app_id and args.pem_file:
         app_id = str(args.app_id).strip()
         src_pem = Path(args.pem_file)
@@ -239,19 +253,19 @@ def main(argv: List[str] | None = None) -> int:
             print(f"Error: PEM file not found at {src_pem}", file=sys.stderr)
             return 1
         pem_text = src_pem.read_text(encoding="utf-8")
+        write_private_key_atomic(target_pem, pem_text, mode=0o400)
+    elif args.app_id and target_pem.is_file():
+        app_id = str(args.app_id).strip()
     else:
-        parser.error("Provide either --code <MANIFEST_CODE>, --app-id <ID> --pem-file <PATH>, or --write-manifest-html <PATH>")
+        parser.error("Provide --code <MANIFEST_CODE>, --app-id <ID> [--pem-file <PATH>], or --write-manifest-html <PATH>")
         return 2
 
-    target_pem = Path(args.target_pem)
-    config_path = Path(args.config)
-
-    write_private_key_atomic(target_pem, pem_text, mode=0o400)
     update_github_app_config(
         config_path=config_path,
         app_id=app_id,
         private_key_path=target_pem,
         default_repo_policy=args.default_policy,
+        legacy_http_callback=args.legacy_http_callback,
     )
 
     if args.pem_file and args.shred_source:
