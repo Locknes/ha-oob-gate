@@ -110,15 +110,17 @@ def evaluate_repo_tag_policy(
       - ("oob", reason)
 
     Tag / Custom Property Precedence (Fail-Closed):
-      1. `oob-deny` / `oob-none` topic or `oob_access` = `none|deny|blocked` -> ALWAYS "deny"
-      2. Explicit Custom Property `oob_access` (`write`, `oob`, `read`)
-      3. Explicit Repository Topic (`oob-write`, `oob-oob`, `oob-read`)
+      1. `oob-deny` / `oob-none` / `agy-deny` / `agy-none` topic or `oob_access` / `agy_access` = `none|deny|blocked` -> ALWAYS "deny"
+      2. Explicit Custom Property `oob_access` (or `agy_access`) (`write`, `oob`, `read`)
+      3. Explicit Repository Topic (`oob-write`/`agy-write`, `oob-oob`/`agy-oob`, `oob-read`/`agy-read`)
       4. `default_policy` (`deny`, `oob`, `read`)
     """
     norm_topics = {t.strip().lower() for t in (topics or [])}
-    prop_oob = str(custom_properties.get("oob_access", "")).strip().lower()
+    prop_oob = str(
+        custom_properties.get("oob_access") or custom_properties.get("agy_access") or ""
+    ).strip().lower()
 
-    if norm_topics & {"oob-deny", "oob-none"} or prop_oob in ("deny", "none", "blocked"):
+    if norm_topics & {"oob-deny", "oob-none", "agy-deny", "agy-none"} or prop_oob in ("deny", "none", "blocked"):
         return "deny", "Repository is explicitly tagged as denied (oob-deny or oob_access=none)"
 
     effective_tier = ""
@@ -126,15 +128,18 @@ def evaluate_repo_tag_policy(
     if prop_oob in ("write", "oob", "read"):
         effective_tier = prop_oob
         source_desc = f"custom property oob_access={prop_oob}"
-    elif "oob-write" in norm_topics:
+    elif norm_topics & {"oob-write", "agy-write"}:
         effective_tier = "write"
-        source_desc = "topic 'oob-write'"
-    elif "oob-oob" in norm_topics:
+        matched = "oob-write" if "oob-write" in norm_topics else "agy-write"
+        source_desc = f"topic '{matched}'"
+    elif norm_topics & {"oob-oob", "agy-oob"}:
         effective_tier = "oob"
-        source_desc = "topic 'oob-oob'"
-    elif "oob-read" in norm_topics:
+        matched = "oob-oob" if "oob-oob" in norm_topics else "agy-oob"
+        source_desc = f"topic '{matched}'"
+    elif norm_topics & {"oob-read", "agy-read"}:
         effective_tier = "read"
-        source_desc = "topic 'oob-read'"
+        matched = "oob-read" if "oob-read" in norm_topics else "agy-read"
+        source_desc = f"topic '{matched}'"
     else:
         effective_tier = default_policy.lower()
         source_desc = f"default policy '{effective_tier}'"
