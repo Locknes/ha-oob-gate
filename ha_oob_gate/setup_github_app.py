@@ -138,10 +138,19 @@ def update_github_app_config(
         cfg["tls_enabled"] = False
         cfg["ha_approval_token"] = ""
 
-    enabled = list(cfg.get("enabled_modules") or [])
-    if "github_token" not in enabled:
-        enabled.append("github_token")
-        cfg["enabled_modules"] = enabled
+    enabled = cfg.get("enabled_modules")
+    if isinstance(enabled, list):
+        if enabled == ["github_token"]:
+            # Restore full module discovery if a prior run collapsed a None list into ["github_token"]
+            cfg.pop("enabled_modules", None)
+        elif "github_token" not in enabled:
+            enabled.append("github_token")
+            cfg["enabled_modules"] = enabled
+
+    if legacy_http_callback:
+        cfg.setdefault("k8s_apiserver", "https://192.168.5.127:6443")
+        cfg.setdefault("k8s_jit_sa_prefix", "jit-agy-")
+        cfg.setdefault("k8s_label_domain", "jit.homelab")
 
     mod_cfg = cfg.setdefault("module_config", {})
     gh_cfg = mod_cfg.setdefault("github_token", {})
