@@ -194,13 +194,7 @@ if [[ ! -f "${CONFIG_FILE}" ]]; then
     chown root:root "${CONFIG_FILE}"
     chmod 0600 "${CONFIG_FILE}"
     echo "      Created ${CONFIG_FILE} from template. Edit ha_url, ha_trusted_ip, and webhook_id!"
-else
-    chown root:root "${CONFIG_FILE}"
-    chmod 0600 "${CONFIG_FILE}"
-    echo "      Preserved existing ${CONFIG_FILE} (mode 0600, root:root)."
-fi
-
-python3 - "${CONFIG_FILE}" << 'PYEOF'
+    python3 - "${CONFIG_FILE}" << 'PYEOF'
 import json, os, secrets, sys
 
 cfg_path = sys.argv[1]
@@ -232,6 +226,11 @@ if changed:
     os.chown(tmp_path, 0, 0)
     os.replace(tmp_path, cfg_path)
 PYEOF
+else
+    chown root:root "${CONFIG_FILE}"
+    chmod 0600 "${CONFIG_FILE}"
+    echo "      Preserved existing ${CONFIG_FILE} (mode 0600, root:root)."
+fi
 
 TLS_CRT="${CONFIG_DIR}/tls.crt"
 TLS_KEY="${CONFIG_DIR}/tls.key"
