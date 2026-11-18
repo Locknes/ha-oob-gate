@@ -55,6 +55,7 @@ RESERVED_TOPICS = frozenset({"oob", "agy"})
 ALLOWED_VISIBILITIES = frozenset({"private", "public"})
 ALLOWED_OOB_TIERS = frozenset({"oob", "read", "deny", "write"})
 
+DEFAULT_REPO_CREATOR_PEM_PATH = "/etc/ha-sudo/secrets/github_repo_creator.pem"
 DEFAULT_REPO_ADMIN_PAT_PATH = "/etc/ha-sudo/secrets/github_repo_admin_pat"
 DEFAULT_USER_OAUTH_PATH = "/etc/ha-sudo/secrets/github_user_oauth.json"
 DEFAULT_OAUTH_TOKEN_URL = "https://github.com/login/oauth/access_token"
@@ -198,15 +199,23 @@ class GitHubRepoCreateModule(BaseGateModule):
         create_cfg = mod_root.get("github_repo_create", {})
         raw_owners = create_cfg.get("allowed_owners") or []
         allowed_owners = [str(o).strip().lower() for o in raw_owners if str(o).strip()]
+
+        token_app_id = str(gh_tok_cfg.get("app_id") or os.environ.get("GITHUB_APP_ID", "")).strip()
+        token_key_path = str(gh_tok_cfg.get("private_key_path") or "/etc/ha-sudo/secrets/github_app.pem")
+
+        has_dedicated_creator_app = bool(str(create_cfg.get("app_id") or "").strip())
+        creator_app_id = str(create_cfg.get("app_id") or token_app_id).strip()
+        creator_key_path = str(
+            create_cfg.get("private_key_path")
+            or (DEFAULT_REPO_CREATOR_PEM_PATH if has_dedicated_creator_app else token_key_path)
+        )
         return {
             "api_url": str(create_cfg.get("api_url") or gh_tok_cfg.get("api_url") or "https://api.github.com").rstrip("/"),
             "oauth_token_url": str(create_cfg.get("oauth_token_url") or DEFAULT_OAUTH_TOKEN_URL),
-            "app_id": str(create_cfg.get("app_id") or gh_tok_cfg.get("app_id") or os.environ.get("GITHUB_APP_ID", "")).strip(),
-            "private_key_path": str(
-                create_cfg.get("private_key_path")
-                or gh_tok_cfg.get("private_key_path")
-                or "/etc/ha-sudo/secrets/github_app.pem"
-            ),
+            "app_id": creator_app_id,
+            "private_key_path": creator_key_path,
+            "token_app_id": token_app_id,
+            "token_private_key_path": token_key_path,
             "repo_admin_pat_path": str(create_cfg.get("repo_admin_pat_path") or DEFAULT_REPO_ADMIN_PAT_PATH),
             "user_oauth_path": str(create_cfg.get("user_oauth_path") or DEFAULT_USER_OAUTH_PATH),
             "vault_pat_path": str(
@@ -221,13 +230,16 @@ class GitHubRepoCreateModule(BaseGateModule):
             "allowed_owners": allowed_owners,
         }
 
-    def _discover_app_installations(self, cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-        app_id = cfg["app_id"]
-        key_path = cfg["private_key_path"]
+    def _discover_app_installations(
+        self,
+        api_url: str,
+        app_id: str,
+        key_path: str,
+    ) -> Dict[str, Dict[str, Any]]:
         if not app_id or not os.path.isfile(key_path):
             return {}
         app_jwt = create_github_app_jwt(app_id, private_key_path=key_path)
-        code, inst_list = _github_api_request(f"{cfg['api_url']}/app/installations", app_jwt, method="GET")
+        code, inst_list = _github_api_request(f"{api_url}/app/installations", app_jwt, method="GET")
         if code != 200 or not isinstance(inst_list, list):
             return {}
         out: Dict[str, Dict[str, Any]] = {}
@@ -315,31 +327,47 @@ class GitHubRepoCreateModule(BaseGateModule):
         params["_gh_api_called"] = True
 
         try:
-            inst_map = self._discover_app_installations(cfg)
+            creator_inst_map = self._discover_app_installations(api_url, cfg["app_id"], cfg["private_key_path"])
+            if cfg["token_app_id"] and (
+                cfg["token_app_id"] != cfg["app_id"] or cfg["token_private_key_path"] != cfg["private_key_path"]
+            ):
+                token_inst_map = self._discover_app_installations(
+                    api_url, cfg["token_app_id"], cfg["token_private_key_path"]
+                )
+            else:
+                token_inst_map = creator_inst_map
         except Exception as e:
             return False, f"Failed querying GitHub App installations: {e}"
 
         owner_low = owner.lower()
-        inst_info = inst_map.get(owner_low)
+        inst_info = creator_inst_map.get(owner_low)
+        token_inst_info = token_inst_map.get(owner_low)
 
-        if mint_token and not inst_info:
+        if mint_token and not token_inst_info:
             return (
                 False,
-                f"--mint-token requires the GitHub App to be installed on '{owner}' so a downscoped single-repo token can be minted",
+                f"--mint-token requires the token-broker GitHub App to be installed on '{owner}' "
+                "so a downscoped single-repo push token can be minted",
             )
 
+        known_installs = creator_inst_map or token_inst_map
         if cfg["allowed_owners"] and owner_low not in cfg["allowed_owners"]:
             return False, f"Security policy: owner '{owner}' is not in allowed_owners ({cfg['allowed_owners']})"
 
-        if inst_map and not cfg["allowed_owners"] and not inst_info:
+        if known_installs and not cfg["allowed_owners"] and (owner_low not in creator_inst_map and owner_low not in token_inst_map):
+            all_logins = sorted({v["login"] for v in (*creator_inst_map.values(), *token_inst_map.values())})
             return (
                 False,
-                f"Security policy: owner '{owner}' does not have the trusted GitHub App installed "
-                f"(installed on: {sorted(v['login'] for v in inst_map.values())})",
+                f"Security policy: owner '{owner}' does not have a trusted GitHub App installed "
+                f"(installed on: {all_logins})",
             )
 
-        # Path 1: Organization owner via GitHub App Installation Token (`administration: write`)
-        if inst_info and inst_info["type"].lower() == "organization":
+        if token_inst_info:
+            params["_token_inst_id"] = token_inst_info["id"]
+            params["_token_inst_selection"] = token_inst_info["repository_selection"]
+
+        # Path 1: Organization owner via Creator GitHub App Installation Token (`administration: write`)
+        if inst_info and inst_info["type"].lower() == "organization" and inst_info["repository_selection"] == "all":
             app_jwt = create_github_app_jwt(cfg["app_id"], private_key_path=cfg["private_key_path"])
             code_tok, tok_data = _github_api_request(
                 f"{api_url}/app/installations/{inst_info['id']}/access_tokens",
@@ -363,20 +391,26 @@ class GitHubRepoCreateModule(BaseGateModule):
                 params["_inst_selection"] = inst_info["repository_selection"]
                 return True, "ok"
 
-        # Path 2: Personal User owner (`POST /user/repos`) or Organization fallback via root user token
+        # Path 2: Personal User owner (`POST /user/repos`) or Selected-Repo Creator App via root user token
         user_tok, tok_source = _load_root_user_token(cfg)
         if not user_tok:
             if inst_info and inst_info["type"].lower() == "organization":
+                if inst_info["repository_selection"] == "selected":
+                    return (
+                        False,
+                        f"Creator GitHub App on organization '{owner}' uses 'Only select repositories'; authorize a "
+                        "user token once via 'python3 -m ha_oob_gate.setup_github_app --role repo-creator --authorize-user' "
+                        "so newly created repositories can be bound and tagged without granting access to existing repos",
+                    )
                 return (
                     False,
-                    f"GitHub App on organization '{owner}' lacks Organization/Repository 'Administration: Read and write' "
-                    "permission (enable it in GitHub App settings -> Permissions & events, then accept on the org installation)",
+                    f"Creator GitHub App on organization '{owner}' lacks 'Administration: Read and write' permission",
                 )
             return (
                 False,
                 f"Creating personal user repositories under '{owner}' requires a one-time GitHub App user authorization "
-                "('python3 -m ha_oob_gate.setup_github_app --authorize-user' as root) or an Administration-only "
-                f"Fine-Grained PAT at {cfg['repo_admin_pat_path']} (alternatively, create under your GitHub Organization)",
+                "('python3 -m ha_oob_gate.setup_github_app --role repo-creator --authorize-user' as root) or an "
+                f"Administration-only Fine-Grained PAT at {cfg['repo_admin_pat_path']}",
             )
 
         code_u, user_info = _github_api_request(f"{api_url}/user", user_tok, method="GET")
@@ -475,6 +509,8 @@ class GitHubRepoCreateModule(BaseGateModule):
         all_topics = [f"oob-{oob_tier}", *extra_topics]
         create_mode = params.get("_create_mode", "")
         inst_id = params.get("_inst_id", "")
+        token_inst_id = params.get("_token_inst_id") or inst_id
+        token_inst_selection = params.get("_token_inst_selection") or params.get("_inst_selection", "")
 
         create_payload = {
             "name": repo_name,
@@ -515,6 +551,20 @@ class GitHubRepoCreateModule(BaseGateModule):
             canonical_full = str(created["full_name"])
             repo_id = created.get("id")
 
+            # Attach newly created repo to Creator App first if Creator App uses 'Only select repositories'
+            # so a zero-Contents Creator App user OAuth token can immediately apply `oob-<tier>` topics.
+            if (
+                create_mode != "github_app_org"
+                and inst_id
+                and repo_id
+                and params.get("_inst_selection") == "selected"
+            ):
+                _github_api_request(
+                    f"{api_url}/user/installations/{inst_id}/repositories/{repo_id}",
+                    auth_tok,
+                    method="PUT",
+                )
+
             # Immediately apply initial OOB policy topic + optional extra topics
             code_top, top_resp = _github_api_request(
                 f"{api_url}/repos/{canonical_full}/topics",
@@ -524,20 +574,23 @@ class GitHubRepoCreateModule(BaseGateModule):
             )
             applied_topics = top_resp.get("names", all_topics) if code_top == 200 else []
 
-            # If created via user token and the GitHub App installation uses "selected" repos, attach this repo
-            app_attached = params.get("_inst_selection") == "all"
+            # Attach newly created repo to Token Broker App (`locklab-oob-gate`) if it uses 'Only select repositories'
+            app_attached = token_inst_selection == "all"
             if (
                 create_mode != "github_app_org"
-                and inst_id
+                and token_inst_id
                 and repo_id
-                and params.get("_inst_selection") == "selected"
+                and token_inst_selection == "selected"
             ):
-                code_att, _ = _github_api_request(
-                    f"{api_url}/user/installations/{inst_id}/repositories/{repo_id}",
-                    auth_tok,
-                    method="PUT",
-                )
-                app_attached = code_att in (204, 304)
+                if token_inst_id == inst_id and params.get("_inst_selection") == "selected":
+                    app_attached = True
+                else:
+                    code_att, _ = _github_api_request(
+                        f"{api_url}/user/installations/{token_inst_id}/repositories/{repo_id}",
+                        auth_tok,
+                        method="PUT",
+                    )
+                    app_attached = code_att in (204, 304)
         finally:
             if temp_app_admin_tok:
                 _github_api_request(f"{api_url}/installation/token", temp_app_admin_tok, method="DELETE")
@@ -550,14 +603,16 @@ class GitHubRepoCreateModule(BaseGateModule):
             "visibility": "private" if created.get("private") else "public",
             "oob_tier": oob_tier,
             "topics": applied_topics,
-            "app_installed": bool(inst_id) and (create_mode == "github_app_org" or app_attached),
+            "app_installed": bool(token_inst_id) and (token_inst_selection == "all" or app_attached),
         }
 
-        if params.get("mint_token") and inst_id:
-            app_jwt = create_github_app_jwt(cfg["app_id"], private_key_path=cfg["private_key_path"])
+        if params.get("mint_token") and token_inst_id:
+            mint_app_id = cfg["token_app_id"] or cfg["app_id"]
+            mint_key_path = cfg["token_private_key_path"] if cfg["token_app_id"] else cfg["private_key_path"]
+            app_jwt = create_github_app_jwt(mint_app_id, private_key_path=mint_key_path)
             _, created_name = canonical_full.split("/", 1)
             code_m, mint_data = _github_api_request(
-                f"{api_url}/app/installations/{inst_id}/access_tokens",
+                f"{api_url}/app/installations/{token_inst_id}/access_tokens",
                 app_jwt,
                 method="POST",
                 payload={
