@@ -148,7 +148,7 @@ def update_github_app_config(
             cfg["enabled_modules"] = enabled
 
     if legacy_http_callback:
-        cfg.setdefault("k8s_apiserver", "https://192.168.5.127:6443")
+        cfg.setdefault("k8s_apiserver", "https://192.0.2.50:6443")
         cfg.setdefault("k8s_jit_sa_prefix", "jit-agy-")
         cfg.setdefault("k8s_label_domain", "jit.homelab")
 
