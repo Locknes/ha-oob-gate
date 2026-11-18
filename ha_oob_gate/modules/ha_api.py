@@ -81,6 +81,8 @@ _SENSITIVE_KV_REDACT_RE = re.compile(
             supervisor_token |
             hassio_token |
             ha_admin_token |
+            github_repo_admin_pat |
+            github_user_oauth |
             webhook_id |
             api_key |
             apikey |

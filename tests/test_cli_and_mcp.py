@@ -103,7 +103,7 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
         init_resp = handle_mcp_jsonrpc_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, self.config)
         self.assertEqual(init_resp["result"]["serverInfo"]["name"], "ha-oob-gate")
         self.assertEqual(init_resp["result"]["serverInfo"]["version"], __version__)
-        self.assertEqual(__version__, "5.0.0")
+        self.assertEqual(__version__, "5.1.0")
 
         list_resp = handle_mcp_jsonrpc_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, self.config)
         tool_names = {t["name"] for t in list_resp["result"]["tools"]}
@@ -113,6 +113,7 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
                 "oob_sudo_batch",
                 "oob_k8s_token",
                 "oob_github_token",
+                "oob_github_create_repo",
                 "oob_ha_api",
                 "oob_ha_api_call",
                 "oob_secret_checkout",

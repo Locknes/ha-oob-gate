@@ -653,6 +653,63 @@ def cmd_github_token(args: argparse.Namespace, config: Dict[str, Any]) -> None:
     sys.exit(1)
 
 
+def cmd_github_create_repo(args: argparse.Namespace, config: Dict[str, Any]) -> None:
+    vis_label = args.visibility.upper()
+    sys.stderr.write(
+        f"[oob-auth] 📦 Requesting mobile approval to create {vis_label} GitHub repository {args.repo} "
+        f"(oob-tier={args.oob_tier})...\n"
+    )
+    sys.stderr.flush()
+    resp = send_unix_socket_request(
+        config["socket_path"],
+        {
+            "action": "module_request",
+            "module": "github_repo_create",
+            "params": {
+                "repo": args.repo,
+                "visibility": args.visibility,
+                "description": args.description,
+                "oob_tier": args.oob_tier,
+                "topics": args.topics or [],
+                "mint_token": bool(args.mint_token),
+                "reason": args.reason,
+            },
+        },
+        timeout=float(config["timeout_seconds"]) + 15,
+    )
+    if resp.get("status") == "approved" and resp.get("html_url"):
+        sys.stderr.write(
+            f"[oob-auth] ✅ Created {resp.get('visibility', args.visibility)} repository {resp['html_url']} "
+            f"(topics: {', '.join(resp.get('topics') or [])}).\n"
+        )
+        if args.mint_token and resp.get("token"):
+            gh_lease_path = _runtime_file_path(".jit-gh-lease.json", create_dir=True)
+            gflags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+            gfd = os.open(gh_lease_path, gflags, 0o600)
+            try:
+                os.fchmod(gfd, 0o600)
+            except OSError:
+                pass
+            with os.fdopen(gfd, "w", encoding="utf-8") as gf:
+                json.dump(
+                    {
+                        "request_id": resp.get("request_id", ""),
+                        "caller_nonce": resp.get("caller_nonce", ""),
+                        "transport": "unix",
+                    },
+                    gf,
+                )
+            sys.stderr.write("[oob-auth] 🔑 Minted 1-hour single-repo GitHub App push token.\n")
+            sys.stdout.write(f"{resp['token']}\n")
+        else:
+            sys.stdout.write(f"{resp['html_url']}\n")
+        sys.exit(0)
+    sys.stderr.write(
+        f"[oob-auth] ❌ GitHub repository creation {resp.get('status', 'denied')}: {resp.get('message', '')}\n"
+    )
+    sys.exit(1)
+
+
 def _save_ha_lease(req_id: str, caller_nonce: str, resp: Dict[str, Any]) -> None:
     ha_lease_out_path = _runtime_file_path(".jit-ha-lease.json", create_dir=True)
     oflags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
@@ -832,6 +889,7 @@ def cmd_revoke(args: argparse.Namespace, config: Dict[str, Any]) -> None:
     lease_out_path = _runtime_file_path(".jit-k8s-lease.json", create_dir=False)
     token_out_path = _runtime_file_path(".jit-k8s-token", create_dir=False)
     ha_lease_out_path = _runtime_file_path(".jit-ha-lease.json", create_dir=False)
+    gh_lease_out_path = _runtime_file_path(".jit-gh-lease.json", create_dir=False)
 
     revoked_any = False
     if os.path.exists(lease_out_path):
@@ -840,8 +898,10 @@ def cmd_revoke(args: argparse.Namespace, config: Dict[str, Any]) -> None:
             os.remove(token_out_path)
     if os.path.exists(ha_lease_out_path):
         revoked_any = _revoke_single_lease_file(ha_lease_out_path, config, "HA API") or revoked_any
+    if os.path.exists(gh_lease_out_path):
+        revoked_any = _revoke_single_lease_file(gh_lease_out_path, config, "GitHub") or revoked_any
     if not revoked_any:
-        sys.stderr.write("[oob-auth] No active K8s or HA API lease metadata found.\n")
+        sys.stderr.write("[oob-auth] No active K8s, HA API, or GitHub lease metadata found.\n")
 
 
 def wait_for_restarted_daemon_commit(socket_path: str, target_sha: str, timeout_sec: float = 14.0) -> Tuple[bool, str]:
@@ -914,6 +974,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         "sudo-batch",
         "k8s-token",
         "github-token",
+        "github-create-repo",
         "ha-api",
         "confirm",
         "secret-checkout",
@@ -954,6 +1015,37 @@ def main(argv: Optional[list[str]] = None) -> None:
         p_gh.add_argument("--permission", default="write", choices=["read", "write"], help="Requested permission level")
         p_gh.add_argument("--reason", default="Git repository operation", help="Reason for GitHub access")
 
+        p_ghc = sub.add_parser(
+            "github-create-repo",
+            help="Create a new GitHub repository gated by mobile approval with automatic OOB policy tagging",
+        )
+        p_ghc.add_argument("--repo", required=True, help="New repository name in 'owner/repo' format")
+        p_ghc.add_argument(
+            "--visibility",
+            default="private",
+            choices=["private", "public"],
+            help="Repository visibility (default: private)",
+        )
+        p_ghc.add_argument("--description", default="", help="Optional repository description")
+        p_ghc.add_argument(
+            "--oob-tier",
+            default="oob",
+            choices=["oob", "read", "deny", "write"],
+            help="Initial OOB access topic applied to the repository (default: oob -> topic 'oob-oob')",
+        )
+        p_ghc.add_argument(
+            "--topics",
+            nargs="*",
+            default=[],
+            help="Optional additional repository topics (excluding reserved oob-*/agy-* tags)",
+        )
+        p_ghc.add_argument(
+            "--mint-token",
+            action="store_true",
+            help="Also mint a 1-hour single-repo GitHub App push token and print it on stdout",
+        )
+        p_ghc.add_argument("--reason", required=True, help="Reason for creating this repository")
+
         p_ha = sub.add_parser("ha-api", help="Execute filtered Home Assistant REST API calls via root proxy (zero raw token exposure)")
         p_ha.add_argument("--lease", action="store_true", help="Request a 15-minute filtered proxy lease")
         p_ha.add_argument("--single", action="store_true", help="Request mobile approval for a single API call without standing lease")
@@ -988,6 +1080,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             cmd_k8s_token(args, config)
         elif args.subcmd == "github-token":
             cmd_github_token(args, config)
+        elif args.subcmd == "github-create-repo":
+            cmd_github_create_repo(args, config)
         elif args.subcmd == "ha-api":
             cmd_ha_api(args, config)
         elif args.subcmd == "confirm":

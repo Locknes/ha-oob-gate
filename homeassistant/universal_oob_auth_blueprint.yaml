@@ -118,6 +118,8 @@ variables:
       {{ trigger.json.icon | trim }}
     {%- elif module_name == 'github_token' -%}
       mdi:github
+    {%- elif module_name == 'github_repo_create' -%}
+      mdi:source-repository-plus
     {%- elif module_name == 'k8s_token' -%}
       mdi:kubernetes
     {%- elif module_name == 'ssh_gate' -%}

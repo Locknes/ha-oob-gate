@@ -72,6 +72,34 @@ MCP_TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "oob_github_create_repo",
+        "description": (
+            "Create a new GitHub repository ('owner/repo') gated by Home Assistant mobile approval, "
+            "automatically applying an initial OOB policy topic ('oob-oob' by default) with zero admin token exposure."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "New repository name in 'owner/repo' format"},
+                "visibility": {"type": "string", "enum": ["private", "public"], "default": "private"},
+                "description": {"type": "string", "description": "Optional repository description"},
+                "oob_tier": {"type": "string", "enum": ["oob", "read", "deny", "write"], "default": "oob"},
+                "topics": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional additional GitHub repository topics (excluding reserved oob-*/agy-* tags)",
+                },
+                "mint_token": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Also mint a 1-hour single-repo GitHub App push token upon creation",
+                },
+                "reason": {"type": "string", "description": "Reason for creating this repository"},
+            },
+            "required": ["repo", "reason"],
+        },
+    },
+    {
         "name": "oob_ha_api",
         "description": (
             "Request a filtered Home Assistant REST API proxy call (`mode='single'`) or 15-minute proxy lease "
@@ -257,6 +285,18 @@ def dispatch_mcp_tool_call(
             {
                 "repo": arguments.get("repo", ""),
                 "permission": arguments.get("permission", "write"),
+                "reason": arguments.get("reason", ""),
+            },
+        ),
+        "oob_github_create_repo": (
+            "github_repo_create",
+            {
+                "repo": arguments.get("repo", ""),
+                "visibility": arguments.get("visibility", "private"),
+                "description": arguments.get("description", ""),
+                "oob_tier": arguments.get("oob_tier", "oob"),
+                "topics": arguments.get("topics", []),
+                "mint_token": bool(arguments.get("mint_token", False)),
                 "reason": arguments.get("reason", ""),
             },
         ),

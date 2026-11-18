@@ -45,6 +45,8 @@ REDACTED_KEY_SUFFIXES = (
     "_password",
     "_passwd",
     "_pem",
+    "_pat",
+    "_oauth",
 )
 
 REDACTED_KEY_SUBSTRINGS = (
