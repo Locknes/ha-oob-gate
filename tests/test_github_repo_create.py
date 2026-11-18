@@ -307,6 +307,98 @@ class TestGitHubRepoCreateModule(unittest.TestCase):
         self.assertEqual(out_url.getvalue(), "https://github.com/Locknes/ha-blueprints\n")
         self.assertIn("[oob-auth]", err_url.getvalue())
 
+    def test_two_app_split_isolates_creator_from_token_broker(self) -> None:
+        from pathlib import Path
+        from ha_oob_gate.setup_github_app import build_app_manifest, update_github_repo_creator_config
+
+        creator_manifest = build_app_manifest(role="repo-creator")
+        self.assertEqual(creator_manifest["name"], "locklab-repo-creator")
+        self.assertEqual(
+            creator_manifest["default_permissions"],
+            {"administration": "write", "metadata": "read"},
+        )
+        self.assertNotIn("contents", creator_manifest["default_permissions"])
+
+        cfg_file = Path(self.tmp_dir.name) / "config.json"
+        serializable_cfg = {k: v for k, v in self.config.items() if not k.startswith("_")}
+        cfg_file.write_text(json.dumps(serializable_cfg), encoding="utf-8")
+        creator_pem = Path(self.tmp_dir.name) / "github_repo_creator.pem"
+        creator_pem.write_text("-----BEGIN RSA PRIVATE KEY-----\ncreator\n-----END RSA PRIVATE KEY-----\n", encoding="utf-8")
+
+        updated_cfg = update_github_repo_creator_config(
+            config_path=cfg_file,
+            app_id="999002",
+            private_key_path=creator_pem,
+            user_oauth_path=Path(self.oauth_path),
+        )
+        # Existing `github_token` App #1 (`5795593`) must remain completely untouched
+        self.assertEqual(updated_cfg["module_config"]["github_token"]["app_id"], "5795593")
+        self.assertEqual(updated_cfg["module_config"]["github_repo_create"]["app_id"], "999002")
+
+        with open(self.oauth_path, "w", encoding="utf-8") as f:
+            json.dump({"client_id": "IvCreator", "access_token": "ghu_creator_oauth"}, f)
+
+        split_engine = GateEngine(updated_cfg)
+        jwt_calls = []
+        api_calls = []
+
+        def fake_jwt(app_id, private_key_path="", private_key_pem="", now=None):
+            jwt_calls.append((str(app_id), str(private_key_path)))
+            return f"jwt_for_{app_id}"
+
+        def fake_gh(url, token, method="GET", payload=None):
+            api_calls.append((method, url, token, payload))
+            if url.endswith("/app/installations"):
+                if token == "jwt_for_999002":
+                    # App #2 (`locklab-repo-creator`): selected-repos only
+                    return 200, [{"id": 202, "repository_selection": "selected", "account": {"login": "Locknes", "type": "User"}}]
+                if token == "jwt_for_5795593":
+                    # App #1 (`locklab-oob-gate`): token broker
+                    return 200, [{"id": 101, "repository_selection": "selected", "account": {"login": "Locknes", "type": "User"}}]
+            if url.endswith("/user") and method == "GET":
+                return 200, {"login": "Locknes"}
+            if url.endswith("/repos/Locknes/ha-blueprints") and method == "GET":
+                return 404, {}
+            if url.endswith("/user/repos") and method == "POST":
+                return 201, {"id": 88801, "full_name": "Locknes/ha-blueprints", "private": False}
+            if url.endswith("/user/installations/202/repositories/88801") and method == "PUT":
+                return 204, {}
+            if url.endswith("/repos/Locknes/ha-blueprints/topics") and method == "PUT":
+                return 200, {"names": payload["names"]}
+            if url.endswith("/user/installations/101/repositories/88801") and method == "PUT":
+                return 204, {}
+            if url.endswith("/app/installations/101/access_tokens") and method == "POST":
+                self.assertEqual(token, "jwt_for_5795593")
+                return 201, {"token": "ghs_minted_by_token_broker_app1", "expires_at": "2026-11-18T21:00:00Z"}
+            return 500, {}
+
+        webhooks = []
+        with patch("ha_oob_gate.modules.github_repo_create.create_github_app_jwt", side_effect=fake_jwt):
+            with patch("ha_oob_gate.modules.github_repo_create._github_api_request", side_effect=fake_gh):
+                with patch("ha_oob_gate.daemon.trigger_ha_webhook", side_effect=lambda cfg, p: (webhooks.append(p) or True)):
+                    pending = split_engine.submit_and_wait(
+                        "github_repo_create",
+                        {"repo": "Locknes/ha-blueprints", "visibility": "public", "mint_token": True, "reason": "2-app split"},
+                        self.caller,
+                        wait_seconds=0,
+                    )
+                    self.assertEqual(pending["status"], "pending")
+                    req_id = pending["request_id"]
+                    split_engine.handle_ha_callback(
+                        req_id, webhooks[0]["approve_nonce"], "approve", "192.0.2.10", "secret-approval-token"
+                    )
+                    resolved = split_engine.wait_for_resolution(req_id, timeout=5.0)
+
+        self.assertEqual(resolved["status"], "approved")
+        self.assertEqual(resolved["token"], "ghs_minted_by_token_broker_app1")
+        # Creator App (202) was attached BEFORE topics PUT, and Token Broker App (101) was also attached
+        method_urls = [(m, u.split("api.github.com")[-1]) for (m, u, _, _) in api_calls]
+        idx_attach_creator = method_urls.index(("PUT", "/user/installations/202/repositories/88801"))
+        idx_topics = method_urls.index(("PUT", "/repos/Locknes/ha-blueprints/topics"))
+        idx_attach_broker = method_urls.index(("PUT", "/user/installations/101/repositories/88801"))
+        self.assertLess(idx_attach_creator, idx_topics)
+        self.assertLess(idx_topics, idx_attach_broker)
+
 
 if __name__ == "__main__":
     unittest.main()

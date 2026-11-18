@@ -21,6 +21,7 @@ PROTECTED_INTERNAL_KEYS = frozenset(
         "k8s_broker_token",
         "hmac_key",
         "github_app_pem",
+        "github_repo_creator_pem",
         "github_push_pat",
         "github_repo_admin_pat",
         "github_user_oauth",
