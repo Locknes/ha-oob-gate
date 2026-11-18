@@ -22,6 +22,8 @@ PROTECTED_INTERNAL_KEYS = frozenset(
         "hmac_key",
         "github_app_pem",
         "github_push_pat",
+        "github_repo_admin_pat",
+        "github_user_oauth",
     }
 )
 

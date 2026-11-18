@@ -50,7 +50,7 @@ Allowed roles: `view`, `jit-workload-operator`, `jit-storage-operator`.
 
 ---
 
-## 3. GitHub Repository Token (`oob-auth github-token`)
+## 3. GitHub Repository Token & OOB Repository Creation (`github-token`, `github-create-repo`)
 
 Request a 1-hour single-repository token evaluated against live repository topics (`oob-read` / `oob-write` / `oob-oob` / `oob-deny`):
 
@@ -59,6 +59,17 @@ TOKEN="$(oob-auth github-token \
   --repo owner/repo \
   --permission write \
   --reason "Push feature branch and open PR")"
+```
+
+Create a new GitHub repository gated by mobile approval (automatically applies `oob-oob` policy topic and optionally mints a 1-hour single-repo push token in the same tap):
+
+```bash
+TOKEN="$(oob-auth github-create-repo \
+  --repo owner/new-repo \
+  --visibility public \
+  --description "Clean Home Assistant blueprints" \
+  --mint-token \
+  --reason "Bootstrap new public blueprint repository")"
 ```
 
 ---

@@ -25,9 +25,13 @@ import os
 import secrets
 import subprocess
 import sys
+import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from .modules.github_repo_create import DEFAULT_USER_OAUTH_PATH, _write_json_secret_atomic
 from .modules.github_token import _github_api_request, create_github_app_jwt
 
 DEFAULT_CONFIG_PATH = Path("/etc/ha-sudo/config.json")
@@ -213,6 +217,99 @@ def verify_github_app_credentials(
     return app_info, installations
 
 
+def authorize_github_app_user_device_flow(
+    client_id: str,
+    target_oauth_path: Path = Path(DEFAULT_USER_OAUTH_PATH),
+    github_web_url: str = "https://github.com",
+) -> Dict[str, Any]:
+    """
+    Run GitHub's OAuth 2.0 Device Flow for a GitHub App (`client_id` = `Iv...`) so personal
+    account repository creation (`POST /user/repos`) works without creating static PATs.
+    Requires 'Enable Device Flow' checked in the GitHub App's General settings and
+    Repository permission 'Administration: Read and write'.
+    """
+    clean_cid = str(client_id).strip()
+    if not clean_cid:
+        raise ValueError("GitHub App client_id is missing from GET /app response")
+
+    base_web = github_web_url.rstrip("/")
+    dev_req = urllib.request.Request(
+        f"{base_web}/login/device/code",
+        data=urllib.parse.urlencode({"client_id": clean_cid}).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "ha-oob-gate/setup-github-app",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(dev_req, timeout=10) as resp:
+        dev_data = json.loads(resp.read().decode("utf-8"))
+
+    device_code = str(dev_data.get("device_code") or "").strip()
+    user_code = str(dev_data.get("user_code") or "").strip()
+    verify_uri = str(dev_data.get("verification_uri") or f"{base_web}/login/device").strip()
+    interval = max(5, int(dev_data.get("interval") or 5))
+    expires_in = int(dev_data.get("expires_in") or 900)
+    if not device_code or not user_code:
+        raise RuntimeError(
+            f"GitHub Device Flow initialization failed: {dev_data.get('error_description') or dev_data}"
+        )
+
+    print(f"\n[setup-github-app] 🔐 Authorize GitHub App User Token (for personal repo creation):")
+    print(f"[setup-github-app]   1. Open:  {verify_uri}")
+    print(f"[setup-github-app]   2. Enter: {user_code}\n", flush=True)
+
+    deadline = time.time() + expires_in
+    while time.time() < deadline:
+        time.sleep(interval)
+        poll_req = urllib.request.Request(
+            f"{base_web}/login/oauth/access_token",
+            data=urllib.parse.urlencode(
+                {
+                    "client_id": clean_cid,
+                    "device_code": device_code,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                }
+            ).encode("utf-8"),
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "ha-oob-gate/setup-github-app",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(poll_req, timeout=10) as p_resp:
+            tok_data = json.loads(p_resp.read().decode("utf-8"))
+
+        err = str(tok_data.get("error") or "")
+        if err == "authorization_pending":
+            continue
+        if err == "slow_down":
+            interval = max(interval + 5, int(tok_data.get("interval") or (interval + 5)))
+            continue
+        if err:
+            raise RuntimeError(
+                f"GitHub Device Flow authorization failed ({err}): {tok_data.get('error_description', '')}"
+            )
+        if tok_data.get("access_token"):
+            now = int(time.time())
+            saved: Dict[str, Any] = {
+                "client_id": clean_cid,
+                "access_token": str(tok_data["access_token"]).strip(),
+                "token_type": str(tok_data.get("token_type") or "bearer"),
+                "created_at": now,
+            }
+            if tok_data.get("refresh_token"):
+                saved["refresh_token"] = str(tok_data["refresh_token"]).strip()
+            if tok_data.get("expires_in"):
+                saved["expires_at"] = now + int(tok_data["expires_in"])
+            _write_json_secret_atomic(str(target_oauth_path), saved)
+            return saved
+
+    raise RuntimeError("Timed out waiting for GitHub Device Flow authorization")
+
+
 def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Provision and verify a multi-owner GitHub App for ha-oob-gate."
@@ -228,6 +325,16 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument(
         "--write-manifest-html",
         help="Write a 1-click GitHub App Manifest registration HTML file to the given path and exit",
+    )
+    parser.add_argument(
+        "--authorize-user",
+        action="store_true",
+        help="Run OAuth Device Flow using the configured GitHub App to authorize personal-account repo creation",
+    )
+    parser.add_argument(
+        "--target-oauth",
+        default=DEFAULT_USER_OAUTH_PATH,
+        help="Target JSON path for GitHub App user OAuth credentials",
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config.json")
     parser.add_argument("--target-pem", default=str(DEFAULT_PEM_PATH), help="Target PEM path")
@@ -249,6 +356,22 @@ def main(argv: List[str] | None = None) -> int:
 
     target_pem = Path(args.target_pem)
     config_path = Path(args.config)
+
+    if args.authorize_user:
+        app_id_auth = str(args.app_id or "").strip()
+        if not app_id_auth and config_path.is_file():
+            cfg_existing = json.loads(config_path.read_text(encoding="utf-8"))
+            app_id_auth = str(cfg_existing.get("module_config", {}).get("github_token", {}).get("app_id") or "").strip()
+        if not app_id_auth or not target_pem.is_file():
+            parser.error("--authorize-user requires an installed GitHub App (config.json app_id + github_app.pem)")
+            return 2
+        app_info_auth, _ = verify_github_app_credentials(app_id_auth, target_pem, api_url=args.api_url)
+        authorize_github_app_user_device_flow(
+            client_id=str(app_info_auth.get("client_id") or ""),
+            target_oauth_path=Path(args.target_oauth),
+        )
+        print(f"[setup-github-app] ✅ Saved GitHub user OAuth token to {args.target_oauth} (0400)")
+        return 0
 
     if args.code:
         conv = exchange_manifest_code(args.code, api_url=args.api_url)
