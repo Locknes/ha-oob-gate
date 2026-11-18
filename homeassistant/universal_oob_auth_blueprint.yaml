@@ -128,6 +128,8 @@ variables:
       mdi:script-text-key-outline
     {%- elif module_name == 'ha_api' -%}
       mdi:home-assistant
+    {%- elif module_name == 'self_update' -%}
+      mdi:shield-sync
     {%- elif module_name == 'generic_confirm' -%}
       mdi:check-decagram
     {%- else -%}
@@ -146,6 +148,8 @@ variables:
       {{ '#EAB308' }}
     {%- elif module_name == 'ha_api' -%}
       {{ '#03A9F4' }}
+    {%- elif module_name == 'self_update' -%}
+      {{ '#DC2626' }}
     {%- elif module_name == 'generic_confirm' -%}
       {{ '#10B981' }}
     {%- else -%}
@@ -224,6 +228,7 @@ actions:
             data:
               tag: "{{ notif_tag }}"
               channel: "{{ notif_channel }}"
+              group: "{{ notif_group }}"
               importance: high
               priority: high
               ttl: 0

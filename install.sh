@@ -142,6 +142,12 @@ cp "${SERVICES_DIR}/ha_sudo_gate.py" "${INSTALL_DIR}/ha_sudo_gate.py"
 chown root:root "${INSTALL_DIR}/ha_sudo_gate.py"
 chmod 0755 "${INSTALL_DIR}/ha_sudo_gate.py"
 
+if command -v git >/dev/null 2>&1 && git -C "${REPO_ROOT}" rev-parse --verify HEAD >/dev/null 2>&1; then
+    git -C "${REPO_ROOT}" rev-parse HEAD > "${INSTALL_DIR}/.installed_commit"
+    chown root:root "${INSTALL_DIR}/.installed_commit"
+    chmod 0644 "${INSTALL_DIR}/.installed_commit"
+fi
+
 if [[ -f "${REPO_ROOT}/homeassistant/universal_oob_auth_blueprint.yaml" ]]; then
     cp -f "${REPO_ROOT}/homeassistant/universal_oob_auth_blueprint.yaml" "${INSTALL_DIR}/universal_oob_auth_blueprint.yaml"
     chown root:root "${INSTALL_DIR}/universal_oob_auth_blueprint.yaml"
@@ -227,6 +233,28 @@ if changed:
     os.replace(tmp_path, cfg_path)
 PYEOF
 else
+    python3 - "${CONFIG_FILE}" << 'PYEOF'
+import json, os, sys
+
+cfg_path = sys.argv[1]
+try:
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    enabled = cfg.get("enabled_modules")
+    self_upd_cfg = (cfg.get("module_config") or {}).get("self_update") or {}
+    if isinstance(enabled, list) and "self_update" not in enabled and self_upd_cfg.get("enabled", True) is not False:
+        enabled.append("self_update")
+        tmp_path = cfg_path + ".tmp"
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(cfg, out, indent=2)
+            out.write("\n")
+        os.chown(tmp_path, 0, 0)
+        os.replace(tmp_path, cfg_path)
+        print("      Enabled 'self_update' module in existing config.json.")
+except Exception as exc:
+    print(f"      [WARN] Could not inspect enabled_modules in {cfg_path}: {exc}", file=sys.stderr)
+PYEOF
     chown root:root "${CONFIG_FILE}"
     chmod 0600 "${CONFIG_FILE}"
     echo "      Preserved existing ${CONFIG_FILE} (mode 0600, root:root)."

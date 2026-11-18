@@ -98,4 +98,7 @@ SECRET_FILE="$(oob-auth secret-checkout --key external_api_key --reason "Run bac
 
 # Request a signed Yes/No mobile confirmation before a high-impact operation (stdout prints receipt HMAC):
 RECEIPT="$(oob-auth confirm --summary "Prune unused volumes" --reason "Reclaim disk space")"
+
+# Update ha-oob-gate itself from CI-verified GitHub main via dedicated 'OOB GATE UPDATE: <host>' channel:
+oob-auth self-update --reason "Deploy latest merged ha-oob-gate release"
 ```
