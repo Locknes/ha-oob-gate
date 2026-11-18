@@ -3,7 +3,7 @@ self_update.py - GitHub-Pinned, CI-Verified Tier-0 Gate Self-Update Module (`sel
 
 Security & Anti-Brick Architecture:
 1. **Zero Local Agent Disk Trust:**
-   Unprivileged callers (`svc-agy`) cannot supply a local file path, custom repository,
+   Unprivileged callers (`ai-agent`) cannot supply a local file path, custom repository,
    branch, or URL. The root daemon fetches commit metadata, GitHub Actions check-runs,
    and source tarballs strictly from the root-configured repository (`Locknes/ha-oob-gate`,
    branch `main`).

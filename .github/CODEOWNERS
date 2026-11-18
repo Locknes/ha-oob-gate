@@ -1,0 +1,6 @@
+# Require explicit human review (@Locknes) on core daemon, modules, security tests, and CI workflows
+/ha_oob_gate/ @Locknes
+/tests/ @Locknes
+/.github/ @Locknes
+/install.sh @Locknes
+/systemd/ @Locknes

@@ -83,7 +83,7 @@ class TestSelfUpdateModule(unittest.TestCase):
 
         self.target_sha = "a" * 40
         self.config: Dict[str, Any] = {
-            "hostname": "rh-agy-bas01",
+            "hostname": "oob-bastion-01",
             "ha_url": "https://homeassistant.example.com",
             "ha_trusted_ip": "192.0.2.10",
             "ha_approval_token": "approval-tok-xyz",
@@ -108,7 +108,7 @@ class TestSelfUpdateModule(unittest.TestCase):
             },
         }
         self.engine = GateEngine(self.config)
-        self.caller = CallerInfo(uid=1001, gid=1001, pid=7001, username="svc-agy", is_root=False)
+        self.caller = CallerInfo(uid=1001, gid=1001, pid=7001, username="ai-agent", is_root=False)
 
     def tearDown(self) -> None:
         self.tmp_dir.cleanup()
@@ -120,7 +120,7 @@ class TestSelfUpdateModule(unittest.TestCase):
             {"branch": "feat/unmerged", "reason": "try unmerged branch"},
             {"tarball_url": "https://evil.example/payload.tgz", "reason": "try custom url"},
             {"install_dir": "/tmp/hijack", "reason": "try custom install_dir"},
-            {"source_dir": "/home/svc-agy/ha-oob-gate", "reason": "try local agent dir"},
+            {"source_dir": "/home/ai-agent/ha-oob-gate", "reason": "try local agent dir"},
         ):
             ok, msg = mod.validate(dict(bad_params), self.caller, self.config)
             self.assertFalse(ok, f"Expected override {bad_params} to be rejected")
@@ -243,8 +243,8 @@ class TestSelfUpdateModule(unittest.TestCase):
             wp = webhooks_sent[0]
 
             # Dedicated high-salience OOB GATE UPDATE channel, group, icon, and crimson color!
-            self.assertEqual(wp["channel"], "OOB GATE UPDATE: rh-agy-bas01")
-            self.assertEqual(wp["group"], "oob_gate_update_rh-agy-bas01")
+            self.assertEqual(wp["channel"], "OOB GATE UPDATE: oob-bastion-01")
+            self.assertEqual(wp["group"], "oob_gate_update_oob-bastion-01")
             self.assertEqual(wp["icon"], "mdi:shield-sync")
             self.assertEqual(wp["color"], "#DC2626")
             self.assertIn("OOB GATE UPDATE", wp["title"])
