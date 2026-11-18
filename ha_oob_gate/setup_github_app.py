@@ -31,11 +31,16 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from .modules.github_repo_create import DEFAULT_USER_OAUTH_PATH, _write_json_secret_atomic
+from .modules.github_repo_create import (
+    DEFAULT_REPO_CREATOR_PEM_PATH,
+    DEFAULT_USER_OAUTH_PATH,
+    _write_json_secret_atomic,
+)
 from .modules.github_token import _github_api_request, create_github_app_jwt
 
 DEFAULT_CONFIG_PATH = Path("/etc/ha-sudo/config.json")
 DEFAULT_PEM_PATH = Path("/etc/ha-sudo/secrets/github_app.pem")
+DEFAULT_CREATOR_PEM = Path(DEFAULT_REPO_CREATOR_PEM_PATH)
 DEFAULT_API_URL = "https://api.github.com"
 
 
@@ -43,18 +48,28 @@ def build_app_manifest(
     app_name: str = "locklab-oob-gate",
     homepage_url: str = "https://github.com/Locknes/ha-oob-gate",
     redirect_url: str = "http://127.0.0.1:8788/callback",
+    role: str = "token-broker",
 ) -> Dict[str, Any]:
-    """Return a GitHub App Manifest dictionary configured for multi-owner single-repo token brokering."""
-    return {
-        "name": app_name,
-        "url": homepage_url,
-        "redirect_url": redirect_url,
-        "public": True,
-        "default_permissions": {
+    """Return a GitHub App Manifest dictionary for `token-broker` or isolated `repo-creator`."""
+    if role == "repo-creator":
+        effective_name = "locklab-repo-creator" if app_name == "locklab-oob-gate" else app_name
+        perms = {
+            "administration": "write",
+            "metadata": "read",
+        }
+    else:
+        effective_name = app_name
+        perms = {
             "contents": "write",
             "pull_requests": "write",
             "metadata": "read",
-        },
+        }
+    return {
+        "name": effective_name,
+        "url": homepage_url,
+        "redirect_url": redirect_url,
+        "public": True,
+        "default_permissions": perms,
         "default_events": [],
     }
 
@@ -63,15 +78,29 @@ def render_manifest_html(
     app_name: str = "locklab-oob-gate",
     homepage_url: str = "https://github.com/Locknes/ha-oob-gate",
     redirect_url: str = "http://127.0.0.1:8788/callback",
+    role: str = "token-broker",
 ) -> str:
     """Render a self-contained HTML page with a 1-click form that registers the GitHub App via Manifest."""
-    manifest_json = json.dumps(build_app_manifest(app_name, homepage_url, redirect_url))
+    manifest_obj = build_app_manifest(app_name, homepage_url, redirect_url, role=role)
+    manifest_json = json.dumps(manifest_obj)
     escaped_manifest = html.escape(manifest_json, quote=True)
+    disp_name = manifest_obj["name"]
+    if role == "repo-creator":
+        perm_desc = (
+            "isolated repo-creation permissions (<code>administration: write</code>, "
+            "<code>metadata: read</code> — <strong>zero <code>contents</code> access</strong>). "
+            "Install with <strong>Only select repositories</strong> so existing Tier-0 repos remain unreachable."
+        )
+    else:
+        perm_desc = (
+            "least-privilege permissions (<code>contents: write</code>, "
+            "<code>pull_requests: write</code>, <code>metadata: read</code>) and no webhooks."
+        )
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Create {html.escape(app_name)} GitHub App</title>
+  <title>Create {html.escape(disp_name)} GitHub App</title>
   <style>
     body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 640px; margin: 3rem auto; padding: 0 1.5rem; background: #0f172a; color: #f8fafc; }}
     .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1.75rem; }}
@@ -81,8 +110,8 @@ def render_manifest_html(
 </head>
 <body>
   <div class="card">
-    <h2>1-Click GitHub App Setup (<code>{html.escape(app_name)}</code>)</h2>
-    <p>This registers a <strong>public: true</strong> GitHub App (so you can install it on both <code>Locknes</code> and <code>locklabs</code>) with least-privilege permissions (<code>contents: write</code>, <code>pull_requests: write</code>, <code>metadata: read</code>) and no webhooks.</p>
+    <h2>1-Click GitHub App Setup (<code>{html.escape(disp_name)}</code>)</h2>
+    <p>This registers a <strong>public: true</strong> GitHub App (for <code>Locknes</code> and <code>locklabs</code>) with {perm_desc}</p>
     <form action="https://github.com/settings/apps/new" method="post">
       <input type="hidden" name="manifest" value="{escaped_manifest}">
       <button type="submit">Create GitHub App on GitHub &rarr;</button>
@@ -165,6 +194,45 @@ def update_github_app_config(
     gh_cfg["private_key_path"] = str(private_key_path)
     gh_cfg["default_repo_policy"] = default_repo_policy
     gh_cfg["allow_vault_pat_fallback"] = bool(allow_vault_pat_fallback)
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = config_path.with_name(f".{config_path.name}.{secrets.token_hex(6)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(tmp_path), flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as out:
+        json.dump(cfg, out, indent=2)
+        out.write("\n")
+        out.flush()
+        os.fsync(out.fileno())
+    if os.geteuid() == 0:
+        os.chown(str(tmp_path), 0, 0)
+    os.replace(str(tmp_path), str(config_path))
+    return cfg
+
+
+def update_github_repo_creator_config(
+    config_path: Path,
+    app_id: str,
+    private_key_path: Path = DEFAULT_CREATOR_PEM,
+    user_oauth_path: Path = Path(DEFAULT_USER_OAUTH_PATH),
+) -> Dict[str, Any]:
+    """Atomically update `module_config.github_repo_create` without altering `github_token`."""
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    else:
+        cfg = {}
+
+    enabled = cfg.get("enabled_modules")
+    if isinstance(enabled, list) and "github_repo_create" not in enabled:
+        enabled.append("github_repo_create")
+        cfg["enabled_modules"] = enabled
+
+    mod_cfg = cfg.setdefault("module_config", {})
+    rc_cfg = mod_cfg.setdefault("github_repo_create", {})
+    rc_cfg["app_id"] = str(app_id).strip()
+    rc_cfg["private_key_path"] = str(private_key_path)
+    rc_cfg["user_oauth_path"] = str(user_oauth_path)
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = config_path.with_name(f".{config_path.name}.{secrets.token_hex(6)}.tmp")
@@ -314,13 +382,19 @@ def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Provision and verify a multi-owner GitHub App for ha-oob-gate."
     )
+    parser.add_argument(
+        "--role",
+        default="token-broker",
+        choices=["token-broker", "repo-creator"],
+        help="GitHub App privilege role: 'token-broker' (contents/PRs) or isolated 'repo-creator' (administration only)",
+    )
     parser.add_argument("--code", help="One-time GitHub App Manifest conversion code from redirect URL")
     parser.add_argument("--app-id", help="Existing GitHub App ID")
     parser.add_argument("--pem-file", help="Path to downloaded GitHub App RSA private key (.pem)")
     parser.add_argument(
         "--shred-source",
         action="store_true",
-        help="Remove the source --pem-file after copying to /etc/ha-sudo/secrets/github_app.pem",
+        help="Remove the source --pem-file after copying to /etc/ha-sudo/secrets/",
     )
     parser.add_argument(
         "--write-manifest-html",
@@ -337,7 +411,7 @@ def main(argv: List[str] | None = None) -> int:
         help="Target JSON path for GitHub App user OAuth credentials",
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config.json")
-    parser.add_argument("--target-pem", default=str(DEFAULT_PEM_PATH), help="Target PEM path")
+    parser.add_argument("--target-pem", default="", help="Target PEM path (defaults by --role)")
     parser.add_argument("--default-policy", default="oob", choices=["deny", "read", "oob", "write"])
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help="GitHub API base URL")
     parser.add_argument(
@@ -350,27 +424,31 @@ def main(argv: List[str] | None = None) -> int:
 
     if args.write_manifest_html:
         out_path = Path(args.write_manifest_html)
-        out_path.write_text(render_manifest_html(), encoding="utf-8")
-        print(f"[setup-github-app] Wrote 1-click GitHub App Manifest launcher to {out_path}")
+        out_path.write_text(render_manifest_html(role=args.role), encoding="utf-8")
+        print(f"[setup-github-app] Wrote 1-click GitHub App Manifest launcher ({args.role}) to {out_path}")
         return 0
 
-    target_pem = Path(args.target_pem)
+    default_pem = DEFAULT_CREATOR_PEM if args.role == "repo-creator" else DEFAULT_PEM_PATH
+    target_pem = Path(args.target_pem) if args.target_pem else default_pem
     config_path = Path(args.config)
 
     if args.authorize_user:
         app_id_auth = str(args.app_id or "").strip()
         if not app_id_auth and config_path.is_file():
             cfg_existing = json.loads(config_path.read_text(encoding="utf-8"))
-            app_id_auth = str(cfg_existing.get("module_config", {}).get("github_token", {}).get("app_id") or "").strip()
+            mod_section = "github_repo_create" if args.role == "repo-creator" else "github_token"
+            app_id_auth = str(cfg_existing.get("module_config", {}).get(mod_section, {}).get("app_id") or "").strip()
+            if not app_id_auth and args.role == "repo-creator":
+                app_id_auth = str(cfg_existing.get("module_config", {}).get("github_token", {}).get("app_id") or "").strip()
         if not app_id_auth or not target_pem.is_file():
-            parser.error("--authorize-user requires an installed GitHub App (config.json app_id + github_app.pem)")
+            parser.error(f"--authorize-user requires an installed GitHub App (app_id + {target_pem})")
             return 2
         app_info_auth, _ = verify_github_app_credentials(app_id_auth, target_pem, api_url=args.api_url)
         authorize_github_app_user_device_flow(
             client_id=str(app_info_auth.get("client_id") or ""),
             target_oauth_path=Path(args.target_oauth),
         )
-        print(f"[setup-github-app] ✅ Saved GitHub user OAuth token to {args.target_oauth} (0400)")
+        print(f"[setup-github-app] ✅ Saved GitHub user OAuth token ({args.role}) to {args.target_oauth} (0400)")
         return 0
 
     if args.code:
@@ -392,13 +470,21 @@ def main(argv: List[str] | None = None) -> int:
         parser.error("Provide --code <MANIFEST_CODE>, --app-id <ID> [--pem-file <PATH>], or --write-manifest-html <PATH>")
         return 2
 
-    update_github_app_config(
-        config_path=config_path,
-        app_id=app_id,
-        private_key_path=target_pem,
-        default_repo_policy=args.default_policy,
-        legacy_http_callback=args.legacy_http_callback,
-    )
+    if args.role == "repo-creator":
+        update_github_repo_creator_config(
+            config_path=config_path,
+            app_id=app_id,
+            private_key_path=target_pem,
+            user_oauth_path=Path(args.target_oauth),
+        )
+    else:
+        update_github_app_config(
+            config_path=config_path,
+            app_id=app_id,
+            private_key_path=target_pem,
+            default_repo_policy=args.default_policy,
+            legacy_http_callback=args.legacy_http_callback,
+        )
 
     if args.pem_file and args.shred_source:
         src_pem = Path(args.pem_file)
