@@ -73,6 +73,8 @@ oob-auth ha-api --lease --scope read --method GET --path /api/states --reason "I
 
 # Subsequent calls within the 15-minute lease reuse it automatically without re-prompting:
 oob-auth ha-api --method GET --path /api/config
+oob-auth ha-api --method GET --path "/api/error_log?lines=500"
+oob-auth ha-api --method GET --path "/api/hassio/addons/a0d7b954_nginxproxymanager/logs?lines=200"
 
 # Request a single scoped admin call (requires explicit --domains):
 oob-auth ha-api --single --scope admin --domains light switch \

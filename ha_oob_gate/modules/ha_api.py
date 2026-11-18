@@ -21,6 +21,7 @@ Security Architecture:
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import posixpath
@@ -30,18 +31,73 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from ..sanitize import sanitize_text
+from ..rotate_ha_service_token import MinimalWebSocket
+from ..sanitize import ANSI_ESCAPE_REGEX, sanitize_text
 from . import BaseGateModule, CallerInfo, NotificationSpec
 
 DEFAULT_HA_TOKEN_SECRET_PATH = "/etc/ha-sudo/secrets/ha_admin_token"
 MAX_SINGLE_BODY_LEN = 500
 MAX_PROXY_BODY_LEN = 8192
 MAX_PROXY_RESPONSE_BYTES = 524288  # 512 KiB cap on proxied responses
+DEFAULT_LOG_TAIL_LINES = 500
+MAX_LOG_TAIL_LINES = 2000
 
 ALLOWED_METHODS_READ = frozenset({"GET"})
 ALLOWED_METHODS_ADMIN = frozenset({"GET", "POST", "DELETE"})
 DOMAIN_NAME_REGEX = re.compile(r"^[a-z0-9_]{1,64}$")
 ENTITY_ID_REGEX = re.compile(r"^([a-z0-9_]{1,64})\.[a-z0-9_]+$")
+
+# Strictly pinned read-only Supervisor journal log endpoints (`GET` only, no `/follow`, no `/info` or `/options`).
+READ_ONLY_SUPERVISOR_LOG_PATH_REGEX = re.compile(
+    r"^/api/hassio/(?:core|supervisor|host|dns|audio|multicast|addons/[a-z0-9][a-z0-9_-]{0,63})/logs$"
+)
+
+# Log sanitization patterns to ensure OOB nonces, webhook IDs, callback headers, and credentials never leak via logs.
+_WEBHOOK_PATH_REDACT_RE = re.compile(r"(/api/(?:webhook|HandleWebhook)/)[A-Za-z0-9_-]{6,}", re.IGNORECASE)
+_OOB_ACTION_REDACT_RE = re.compile(r"\b(APPROVE_OOB|DENY_OOB)(?:_[A-Za-z0-9_-]*)?\b", re.IGNORECASE)
+_BEARER_REDACT_RE = re.compile(r"\b(Bearer)\s+[A-Za-z0-9._~+/-]+=*", re.IGNORECASE)
+_BASIC_REDACT_RE = re.compile(r"\b(Basic)\s+[A-Za-z0-9+/=]{8,}", re.IGNORECASE)
+_AUTH_HEADER_REDACT_RE = re.compile(r"""(?i)(["']?\bAuthorization\b["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n,;}\]]+)""")
+_JWT_REDACT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
+_GH_TOKEN_REDACT_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,})\b")
+_SENSITIVE_KV_REDACT_RE = re.compile(
+    r"""(?ix)
+    (
+        ["']?\b
+        (?:
+            approve_nonce |
+            deny_nonce |
+            caller_nonce |
+            nonce |
+            x-ha-approval-token |
+            ha_oob_approval_token |
+            ha_approval_token |
+            x-origin-secret |
+            access_token |
+            refresh_token |
+            id_token |
+            client_secret |
+            cookie_secret |
+            supervisor_token |
+            hassio_token |
+            ha_admin_token |
+            webhook_id |
+            api_key |
+            apikey |
+            password |
+            passwd |
+            private_key
+        )
+        \b["']?
+        \s*[:=]\s*
+    )
+    (?:
+        "[^"\r\n]*" |
+        '[^'\r\n]*' |
+        [^\s,;}\]\)\r\n]+
+    )
+    """
+)
 
 FORBIDDEN_SERVICE_DOMAINS: Set[str] = {
     "rest_command",
@@ -279,6 +335,75 @@ def _inspect_structured_payload(
     return True, "ok"
 
 
+def _parse_log_query_lines(raw_query: str) -> Tuple[bool, int, str]:
+    """
+    Strictly validate query parameters on log endpoints (`/api/error_log` and `/api/hassio/.../logs`).
+    Only an empty query string or `lines=<1..2000>` is permitted.
+    """
+    if not raw_query:
+        return True, DEFAULT_LOG_TAIL_LINES, "ok"
+
+    pairs = urllib.parse.parse_qsl(raw_query, keep_blank_values=True, strict_parsing=False)
+    if len(pairs) != 1 or pairs[0][0] != "lines":
+        return (
+            False,
+            0,
+            "Log endpoints only accept an optional '?lines=<1..2000>' query parameter",
+        )
+    raw_val = pairs[0][1].strip()
+    if not raw_val.isdigit():
+        return False, 0, "Query parameter 'lines' must be a positive integer between 1 and 2000"
+    lines = int(raw_val)
+    if lines < 1 or lines > MAX_LOG_TAIL_LINES:
+        return False, 0, f"Query parameter 'lines' must be between 1 and {MAX_LOG_TAIL_LINES}"
+    return True, lines, "ok"
+
+
+def redact_ha_log_output(raw_text: str, config: Optional[Dict[str, Any]] = None, token: str = "") -> str:
+    """
+    Scrub OOB nonces, webhook IDs, callback approval tokens, bearer/JWT secrets, ANSI escapes,
+    and Jinja2 delimiters from Home Assistant log output before returning to an unprivileged caller.
+    """
+    if not raw_text:
+        return ""
+    cleaned = ANSI_ESCAPE_REGEX.sub("", str(raw_text))
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = "".join(ch for ch in cleaned if ch.isprintable() or ch in "\n\t ")
+
+    # Exact-value redaction for active root configuration secrets
+    cfg = config or {}
+    exact_secrets = [
+        (token, "[REDACTED_HA_TOKEN]"),
+        (str(cfg.get("ha_admin_token") or "").strip(), "[REDACTED_HA_TOKEN]"),
+        (str(cfg.get("webhook_id") or "").strip(), "[REDACTED_OOB_WEBHOOK_ID]"),
+        (str(cfg.get("ha_approval_token") or "").strip(), "[REDACTED_OOB_APPROVAL_TOKEN]"),
+    ]
+    for sec_val, placeholder in exact_secrets:
+        if len(sec_val) >= 6 and sec_val in cleaned:
+            cleaned = cleaned.replace(sec_val, placeholder)
+
+    # Pattern-based redaction for OOB webhooks, nonces, actions, tokens, and credentials
+    cleaned = _WEBHOOK_PATH_REDACT_RE.sub(r"\1[REDACTED_WEBHOOK_ID]", cleaned)
+    cleaned = _OOB_ACTION_REDACT_RE.sub(r"\1_[REDACTED]", cleaned)
+    cleaned = _AUTH_HEADER_REDACT_RE.sub(r'\1"[REDACTED]"', cleaned)
+    cleaned = _BEARER_REDACT_RE.sub(r"\1 [REDACTED_TOKEN]", cleaned)
+    cleaned = _BASIC_REDACT_RE.sub(r"\1 [REDACTED_CREDENTIALS]", cleaned)
+    cleaned = _JWT_REDACT_RE.sub("[REDACTED_JWT]", cleaned)
+    cleaned = _GH_TOKEN_REDACT_RE.sub("[REDACTED_GH_TOKEN]", cleaned)
+    cleaned = _SENSITIVE_KV_REDACT_RE.sub(r'\1"[REDACTED]"', cleaned)
+
+    # Neutralize Jinja2 template delimiters without collapsing multiline log structure
+    cleaned = (
+        cleaned.replace("{{", "{ {")
+        .replace("}}", "} }")
+        .replace("{%", "{ %")
+        .replace("%}", "% }")
+        .replace("{#", "{ #")
+        .replace("#}", "# }")
+    )
+    return cleaned
+
+
 def validate_ha_proxy_call(
     method: str,
     raw_path: str,
@@ -309,11 +434,21 @@ def validate_ha_proxy_call(
     if norm_lower != "/api" and not norm_lower.startswith("/api/"):
         return False, "Home Assistant API path must start with /api"
 
+    is_supervisor_log_read = method_u == "GET" and bool(READ_ONLY_SUPERVISOR_LOG_PATH_REGEX.match(norm_path))
+    is_error_log_read = method_u == "GET" and norm_path == "/api/error_log"
+
     # 1. Hard endpoint denylist: block webhooks, event firing, templates, intents, supervisor, auth, and protected services
     for prefix in FORBIDDEN_PATH_PREFIXES:
         p_low = prefix.lower()
         if norm_lower == p_low or norm_lower.startswith(p_low + "/"):
+            if p_low == "/api/hassio" and is_supervisor_log_read:
+                continue
             return False, f"Security policy: Home Assistant endpoint '{prefix}' is permanently blocked"
+
+    if is_supervisor_log_read or is_error_log_read:
+        lines_ok, _, lines_err = _parse_log_query_lines(query_or_err)
+        if not lines_ok:
+            return False, lines_err
 
     if norm_lower == "/api/events" or norm_lower.startswith("/api/events/"):
         if method_u != "GET" or norm_lower != "/api/events":
@@ -361,8 +496,10 @@ def validate_ha_proxy_call(
             return False, struct_err
 
     # 4. Scope-specific endpoint rules
-    is_read_endpoint = decoded_path in READ_ALLOWED_EXACT_PATHS or any(
-        decoded_path.startswith(p) for p in READ_ALLOWED_PREFIXES
+    is_read_endpoint = (
+        norm_path in READ_ALLOWED_EXACT_PATHS
+        or is_supervisor_log_read
+        or any(decoded_path.startswith(p) for p in READ_ALLOWED_PREFIXES)
     )
     if scope_l == "read":
         if not is_read_endpoint:
@@ -416,6 +553,121 @@ def _load_ha_admin_token(config: Dict[str, Any]) -> str:
     )
 
 
+def _fetch_plain_log_http(
+    url: str,
+    token: str,
+    config: Dict[str, Any],
+    tail_lines: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Fetch a plain-text Home Assistant / Supervisor log endpoint and scrub sensitive tokens/nonces."""
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "text/plain")
+    if tail_lines is not None:
+        req.add_header("Range", f"entries=:-{int(tail_lines)}:")
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw_resp = resp.read(MAX_PROXY_RESPONSE_BYTES + 1)
+            truncated = len(raw_resp) > MAX_PROXY_RESPONSE_BYTES
+            text_resp = raw_resp[:MAX_PROXY_RESPONSE_BYTES].decode("utf-8", errors="replace")
+            redacted = redact_ha_log_output(text_resp, config=config, token=token)
+            return {
+                "status": "ok",
+                "http_status": resp.status,
+                "truncated": truncated,
+                "data": redacted,
+            }
+    except urllib.error.HTTPError as e:
+        err_text = e.read(8192).decode("utf-8", errors="replace")
+        return {
+            "status": "http_error",
+            "http_status": e.code,
+            "message": f"Home Assistant HTTP {e.code}",
+            "data": redact_ha_log_output(err_text, config=config, token=token),
+        }
+
+
+def _fetch_system_log_websocket_oneshot(
+    ha_url: str,
+    token: str,
+    config: Dict[str, Any],
+    max_entries: int = DEFAULT_LOG_TAIL_LINES,
+) -> Dict[str, Any]:
+    """
+    Execute a hardcoded, non-interactive one-shot `{"type": "system_log/list"}` read over
+    Home Assistant's WebSocket API inside the root daemon (used when `/api/error_log` and
+    Supervisor `/api/hassio/core/logs` are unavailable, e.g. HA Container/Core 2025.10+).
+    Zero caller-controlled parameters are ever placed into WebSocket frames.
+    """
+    if ha_url.startswith("https://"):
+        ws_url = "wss://" + ha_url[len("https://") :] + "/api/websocket"
+    elif ha_url.startswith("http://"):
+        ws_url = "ws://" + ha_url[len("http://") :] + "/api/websocket"
+    else:
+        raise ValueError("ha_url must start with http:// or https://")
+
+    verify_ssl = bool(config.get("ha_tls_verify", True))
+    with MinimalWebSocket(ws_url, verify_ssl=verify_ssl, timeout=10.0) as ws:
+        ws.authenticate(token)
+        ws_resp = ws.call_cmd({"type": "system_log/list"})
+
+    if not ws_resp.get("success"):
+        err_info = ws_resp.get("error") or {}
+        err_msg = redact_ha_log_output(str(err_info.get("message", "system_log/list failed")), config=config, token=token)
+        return {
+            "status": "http_error",
+            "http_status": 502,
+            "message": f"Home Assistant system_log/list error: {err_msg}",
+            "data": err_msg,
+        }
+
+    entries = ws_resp.get("result")
+    if not isinstance(entries, list):
+        entries = []
+
+    # Sort chronologically (oldest -> newest) and cap to `max_entries`
+    sorted_entries = sorted(
+        (item for item in entries if isinstance(item, dict)),
+        key=lambda item: float(item.get("timestamp") or 0.0),
+    )[-max_entries:]
+
+    lines_out: List[str] = []
+    for item in sorted_entries:
+        ts_raw = item.get("timestamp")
+        try:
+            ts_str = datetime.datetime.fromtimestamp(float(ts_raw), tz=datetime.timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            )
+        except Exception:
+            ts_str = "unknown-time"
+        level = str(item.get("level") or "INFO").upper()
+        logger_name = str(item.get("name") or "homeassistant")
+        src = item.get("source")
+        src_str = f" ({src[0]}:{src[1]})" if isinstance(src, list) and len(src) >= 2 else ""
+        msg_raw = item.get("message")
+        if isinstance(msg_raw, list):
+            msg_str = " | ".join(str(m) for m in msg_raw if m is not None)
+        else:
+            msg_str = str(msg_raw or "")
+        count = int(item.get("count") or 1)
+        count_suffix = f" [x{count}]" if count > 1 else ""
+        lines_out.append(f"{ts_str} {level} [{logger_name}]{src_str} {msg_str}{count_suffix}")
+
+    combined = "\n".join(lines_out)
+    encoded = combined.encode("utf-8")
+    truncated = len(encoded) > MAX_PROXY_RESPONSE_BYTES
+    if truncated:
+        combined = encoded[:MAX_PROXY_RESPONSE_BYTES].decode("utf-8", errors="replace")
+
+    return {
+        "status": "ok",
+        "http_status": 200,
+        "truncated": truncated,
+        "data": redact_ha_log_output(combined, config=config, token=token),
+    }
+
+
 def execute_ha_proxy_call(
     method: str,
     raw_path: str,
@@ -427,9 +679,9 @@ def execute_ha_proxy_call(
     if not ha_url:
         raise RuntimeError("Missing ha_url in /etc/ha-sudo/config.json")
 
-    path_ok, canonical_path, _, path_err = _canonicalize_and_validate_path(raw_path)
+    path_ok, canonical_path, decoded_path, query_or_err = _canonicalize_and_validate_path(raw_path)
     if not path_ok:
-        raise ValueError(path_err)
+        raise ValueError(path_err := query_or_err)
 
     body_ok, _, canonical_body, body_err = _parse_and_normalize_json_body(body)
     if not body_ok:
@@ -437,6 +689,37 @@ def execute_ha_proxy_call(
 
     token = _load_ha_admin_token(config)
     method_u = method.upper().strip()
+    norm_path = decoded_path.rstrip("/") if decoded_path != "/api/" else "/api"
+
+    # Safe read-only Supervisor journal log endpoints (`/api/hassio/.../logs`)
+    if method_u == "GET" and READ_ONLY_SUPERVISOR_LOG_PATH_REGEX.match(norm_path):
+        if canonical_body is not None:
+            raise ValueError("GET requests may not include a request body")
+        lines_ok, tail_lines, lines_err = _parse_log_query_lines(query_or_err)
+        if not lines_ok:
+            raise ValueError(lines_err)
+        return _fetch_plain_log_http(f"{ha_url}{norm_path}", token, config=config, tail_lines=tail_lines)
+
+    # Safe `/api/error_log` handler with automatic HA 2025.10+ Supervisor & one-shot `system_log/list` fallback
+    if method_u == "GET" and norm_path == "/api/error_log":
+        if canonical_body is not None:
+            raise ValueError("GET requests may not include a request body")
+        lines_ok, tail_lines, lines_err = _parse_log_query_lines(query_or_err)
+        if not lines_ok:
+            raise ValueError(lines_err)
+
+        legacy_res = _fetch_plain_log_http(f"{ha_url}/api/error_log", token, config=config, tail_lines=None)
+        if legacy_res.get("status") == "ok" or legacy_res.get("http_status") != 404:
+            return legacy_res
+
+        sup_res = _fetch_plain_log_http(f"{ha_url}/api/hassio/core/logs", token, config=config, tail_lines=tail_lines)
+        if sup_res.get("status") == "ok":
+            return sup_res
+        if sup_res.get("http_status") not in (401, 403, 404):
+            return sup_res
+
+        return _fetch_system_log_websocket_oneshot(ha_url, token, config=config, max_entries=tail_lines)
+
     url = f"{ha_url}{canonical_path}"
 
     req_bytes: Optional[bytes] = None
@@ -469,7 +752,7 @@ def execute_ha_proxy_call(
             "status": "http_error",
             "http_status": e.code,
             "message": f"Home Assistant HTTP {e.code}",
-            "data": err_text,
+            "data": redact_ha_log_output(err_text, config=config, token=token),
         }
 
 

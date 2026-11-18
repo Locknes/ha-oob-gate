@@ -30,6 +30,7 @@ DEFAULT_CONFIG_PATH = Path("/etc/ha-sudo/config.json")
 DEFAULT_TOKEN_PATH = Path("/etc/ha-sudo/secrets/ha_admin_token")
 TOKEN_LIFESPAN_DAYS = 3650
 MAX_HANDSHAKE_HEADER_BYTES = 16384
+MAX_WS_MESSAGE_BYTES = 4 * 1024 * 1024
 
 
 def _ssl_context(verify_ssl: bool) -> ssl.SSLContext:
@@ -173,6 +174,7 @@ class MinimalWebSocket:
     def recv_json(self) -> dict:
         assert self.sock is not None
         fragments: list[bytes] = []
+        total_bytes = 0
         while True:
             b1, b2 = self._recv_exact(2)
             fin = bool(b1 & 0x80)
@@ -183,6 +185,8 @@ class MinimalWebSocket:
                 (length,) = struct.unpack("!H", self._recv_exact(2))
             elif length == 127:
                 (length,) = struct.unpack("!Q", self._recv_exact(8))
+            if length > MAX_WS_MESSAGE_BYTES or (total_bytes + length) > MAX_WS_MESSAGE_BYTES:
+                raise RuntimeError(f"WebSocket message exceeded {MAX_WS_MESSAGE_BYTES} byte safety limit")
             mask_key = self._recv_exact(4) if masked else b""
             data = self._recv_exact(length)
             if masked:
@@ -196,6 +200,7 @@ class MinimalWebSocket:
                 continue
             if opcode in (0x0, 0x1, 0x2):
                 fragments.append(data)
+                total_bytes += len(data)
                 if fin:
                     raw = b"".join(fragments).decode("utf-8")
                     return json.loads(raw)
