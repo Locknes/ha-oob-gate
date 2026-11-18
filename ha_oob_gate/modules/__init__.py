@@ -44,6 +44,8 @@ class NotificationSpec:
     command_summary: str = ""
     icon: str = ""
     color: str = ""
+    channel: str = ""
+    group: str = ""
 
 
 class BaseGateModule:

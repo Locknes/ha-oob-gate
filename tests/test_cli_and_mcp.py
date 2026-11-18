@@ -117,6 +117,7 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
                 "oob_ha_api_call",
                 "oob_secret_checkout",
                 "oob_confirm",
+                "oob_self_update",
                 "oob_revoke",
             },
         )

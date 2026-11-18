@@ -24,7 +24,8 @@
     "github_token",
     "ha_api",
     "generic_confirm",
-    "secret_checkout"
+    "secret_checkout",
+    "self_update"
   ],
   "default_sudo_scope": "command_pinned",
   "agent_users": [
@@ -42,6 +43,12 @@
     "github_token": {
       "allow_vault_pat_fallback": false,
       "default_repo_policy": "deny"
+    },
+    "self_update": {
+      "enabled": true,
+      "repo": "Locknes/ha-oob-gate",
+      "branch": "main",
+      "require_ci_green": true
     }
   },
   "max_requests_per_10m": 6,

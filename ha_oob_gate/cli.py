@@ -33,7 +33,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from .daemon import (
     DEFAULT_CONFIG_PATH,
@@ -844,6 +844,62 @@ def cmd_revoke(args: argparse.Namespace, config: Dict[str, Any]) -> None:
         sys.stderr.write("[oob-auth] No active K8s or HA API lease metadata found.\n")
 
 
+def wait_for_restarted_daemon_commit(socket_path: str, target_sha: str, timeout_sec: float = 14.0) -> Tuple[bool, str]:
+    """
+    Poll `gate_health` over `/run/ha-sudo/daemon.sock` after a detached `self_update` restart
+    until the restarted daemon reports `installed_commit == target_sha` (or watchdog rollback).
+    """
+    time.sleep(1.0)
+    deadline = time.time() + timeout_sec
+    last_seen = ""
+    while time.time() < deadline:
+        try:
+            health = send_unix_socket_request(socket_path, {"action": "gate_health"}, timeout=2.0)
+            if health.get("status") == "ok":
+                last_seen = str(health.get("installed_commit") or "")
+                if last_seen == target_sha:
+                    return True, last_seen
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False, last_seen
+
+
+def cmd_self_update(args: argparse.Namespace, config: Dict[str, Any]) -> None:
+    sys.stderr.write(
+        "[oob-auth] 🚨 Requesting Tier-0 OOB Gate self-update (dispatched on dedicated OOB GATE UPDATE channel)...\n"
+    )
+    sys.stderr.flush()
+    resp = send_unix_socket_request(
+        config["socket_path"],
+        {
+            "action": "module_request",
+            "module": "self_update",
+            "params": {"reason": args.reason},
+        },
+        timeout=float(config.get("timeout_seconds", 900)) + 20,
+    )
+    if resp.get("status") != "approved":
+        sys.stderr.write(f"[oob-auth] ❌ Gate self-update {resp.get('status', 'denied')}: {resp.get('message', '')}\n")
+        sys.exit(1)
+
+    target_sha = str(resp.get("target_commit") or "")
+    if resp.get("restarting") and target_sha:
+        sys.stderr.write(f"[oob-auth] 🔄 Approved! Waiting for daemon restart & watchdog check ({target_sha[:10]})...\n")
+        sys.stderr.flush()
+        ok, seen_sha = wait_for_restarted_daemon_commit(config["socket_path"], target_sha)
+        if not ok:
+            sys.stderr.write(
+                f"[oob-auth] ❌ Post-update health check did not reach {target_sha[:10]} "
+                f"(active commit: {seen_sha[:10] or 'unknown'} — watchdog may have rolled back).\n"
+            )
+            sys.exit(1)
+
+    sys.stderr.write(f"[oob-auth] ✅ OOB Gate self-updated to {target_sha[:10]} and verified healthy!\n")
+    sys.stdout.write(f"{target_sha}\n")
+    sys.exit(0)
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     argv = argv if argv is not None else sys.argv[1:]
     config = load_config()
@@ -854,7 +910,16 @@ def main(argv: Optional[list[str]] = None) -> None:
         run_mcp_stdio_server(config)
         return
 
-    subcommands = {"sudo-batch", "k8s-token", "github-token", "ha-api", "confirm", "secret-checkout", "revoke"}
+    subcommands = {
+        "sudo-batch",
+        "k8s-token",
+        "github-token",
+        "ha-api",
+        "confirm",
+        "secret-checkout",
+        "self-update",
+        "revoke",
+    }
     if argv and argv[0] in subcommands:
         parser = argparse.ArgumentParser(prog="oob-auth", description="Universal Out-of-Band Auth Client")
         sub = parser.add_subparsers(dest="subcmd", required=True)
@@ -908,6 +973,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         p_sec.add_argument("--reason", required=True, help="Reason for secret checkout")
         p_sec.add_argument("--stdout", action="store_true", help="Print secret value to stdout instead of writing 0600 file path")
 
+        p_upd = sub.add_parser(
+            "self-update",
+            help="Update ha-oob-gate from CI-verified GitHub main via dedicated OOB GATE UPDATE channel with auto-rollback",
+        )
+        p_upd.add_argument("--reason", required=True, help="Reason for updating the Tier-0 OOB Gate daemon")
+
         sub.add_parser("revoke", help="Immediately revoke active Kubernetes JWT or Home Assistant API lease")
 
         args = parser.parse_args(argv)
@@ -923,6 +994,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             cmd_confirm(args, config)
         elif args.subcmd == "secret-checkout":
             cmd_secret_checkout(args, config)
+        elif args.subcmd == "self-update":
+            cmd_self_update(args, config)
         elif args.subcmd == "revoke":
             cmd_revoke(args, config)
         return

@@ -141,6 +141,20 @@ MCP_TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "oob_self_update",
+        "description": (
+            "Request a CI-verified self-update of the Tier-0 ha-oob-gate daemon straight from GitHub main, "
+            "dispatched on the dedicated 'OOB GATE UPDATE: <hostname>' notification channel with automatic rollback."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "Why the OOB Gate daemon update is needed"},
+            },
+            "required": ["reason"],
+        },
+    },
+    {
         "name": "oob_revoke",
         "description": "Immediately revoke an active lease by `request_id` and `caller_nonce`.",
         "inputSchema": {
@@ -162,6 +176,7 @@ def dispatch_mcp_tool_call(
     socket_requester: Optional[Callable[[str, Dict[str, Any], float], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Dispatch an MCP `tools/call` invocation over the local `ha-oob-gate` Unix socket."""
+    is_default_requester = socket_requester is None
     if socket_requester is None:
         from .cli import send_unix_socket_request
 
@@ -271,6 +286,12 @@ def dispatch_mcp_tool_call(
                 "reason": arguments.get("reason", ""),
             },
         ),
+        "oob_self_update": (
+            "self_update",
+            {
+                "reason": arguments.get("reason", ""),
+            },
+        ),
     }
 
     if tool_name not in module_map:
@@ -289,6 +310,24 @@ def dispatch_mcp_tool_call(
         },
         timeout,
     )
+    if (
+        tool_name == "oob_self_update"
+        and is_default_requester
+        and resp.get("status") == "approved"
+        and resp.get("restarting")
+        and resp.get("target_commit")
+    ):
+        from .cli import wait_for_restarted_daemon_commit
+
+        ok_restart, seen_sha = wait_for_restarted_daemon_commit(sock_path, str(resp["target_commit"]))
+        resp["verified_after_restart"] = ok_restart
+        resp["active_commit"] = seen_sha
+        if not ok_restart:
+            resp["status"] = "error"
+            resp["message"] = (
+                f"Post-update health check did not reach {resp['target_commit'][:10]} "
+                f"(active: {seen_sha[:10] or 'unknown'})"
+            )
     is_err = resp.get("status") != "approved"
     return {
         "content": [{"type": "text", "text": json.dumps(resp, indent=2)}],
