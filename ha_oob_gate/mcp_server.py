@@ -66,6 +66,11 @@ MCP_TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "repo": {"type": "string", "description": "Target repository in 'owner/repo' format"},
                 "permission": {"type": "string", "enum": ["read", "write"], "default": "write"},
+                "workflows": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Also request 'workflows: write' permission for .github/workflows/* (requires permission='write'; always triggers OOB phone approval)",
+                },
                 "reason": {"type": "string", "description": "Reason for GitHub repository access"},
             },
             "required": ["repo", "reason"],
@@ -93,6 +98,11 @@ MCP_TOOLS: List[Dict[str, Any]] = [
                     "type": "boolean",
                     "default": False,
                     "description": "Also mint a 1-hour single-repo GitHub App push token upon creation",
+                },
+                "workflows": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "With mint_token=true, also include 'workflows: write' on the minted push token",
                 },
                 "reason": {"type": "string", "description": "Reason for creating this repository"},
             },
@@ -285,6 +295,7 @@ def dispatch_mcp_tool_call(
             {
                 "repo": arguments.get("repo", ""),
                 "permission": arguments.get("permission", "write"),
+                "workflows": bool(arguments.get("workflows", False)),
                 "reason": arguments.get("reason", ""),
             },
         ),
@@ -297,6 +308,7 @@ def dispatch_mcp_tool_call(
                 "oob_tier": arguments.get("oob_tier", "oob"),
                 "topics": arguments.get("topics", []),
                 "mint_token": bool(arguments.get("mint_token", False)),
+                "workflows": bool(arguments.get("workflows", False)),
                 "reason": arguments.get("reason", ""),
             },
         ),

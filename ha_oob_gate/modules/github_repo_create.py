@@ -322,6 +322,10 @@ class GitHubRepoCreateModule(BaseGateModule):
 
         mint_token = bool(params.get("mint_token", False))
         params["mint_token"] = mint_token
+        workflows = bool(params.get("workflows", False))
+        if workflows and not mint_token:
+            return False, "--workflows on github-create-repo requires --mint-token"
+        params["workflows"] = workflows
 
         api_url = cfg["api_url"]
         params["_gh_api_called"] = True
@@ -460,7 +464,14 @@ class GitHubRepoCreateModule(BaseGateModule):
         all_topics = [f"oob-{oob_tier}", *extra_topics]
         desc = sanitize_text(params.get("description", "") or "(none)", max_len=140)
         reason = sanitize_text(params.get("reason", ""), max_len=200)
-        mint_note = "Yes (1h single-repo push token)" if params.get("mint_token") else "No"
+        if params.get("mint_token"):
+            mint_note = (
+                "Yes (1h single-repo WRITE + WORKFLOWS token ⚠️)"
+                if params.get("workflows")
+                else "Yes (1h single-repo push token)"
+            )
+        else:
+            mint_note = "No"
 
         vis_badge = "🌐 PUBLIC (WORLD-READABLE)" if is_pub else "🔒 PRIVATE"
         title = (
@@ -611,17 +622,20 @@ class GitHubRepoCreateModule(BaseGateModule):
             mint_key_path = cfg["token_private_key_path"] if cfg["token_app_id"] else cfg["private_key_path"]
             app_jwt = create_github_app_jwt(mint_app_id, private_key_path=mint_key_path)
             _, created_name = canonical_full.split("/", 1)
+            mint_perms = {
+                "metadata": "read",
+                "contents": "write",
+                "pull_requests": "write",
+            }
+            if params.get("workflows"):
+                mint_perms["workflows"] = "write"
             code_m, mint_data = _github_api_request(
                 f"{api_url}/app/installations/{token_inst_id}/access_tokens",
                 app_jwt,
                 method="POST",
                 payload={
                     "repositories": [created_name],
-                    "permissions": {
-                        "metadata": "read",
-                        "contents": "write",
-                        "pull_requests": "write",
-                    },
+                    "permissions": mint_perms,
                 },
             )
             if code_m != 201 or not mint_data.get("token"):
@@ -630,6 +644,7 @@ class GitHubRepoCreateModule(BaseGateModule):
                     f"{mint_data.get('message', '')}"
                 )
             result["mode"] = "github_app"
+            result["workflows"] = bool(params.get("workflows", False))
             result["token"] = mint_data["token"]
             result["expires_at"] = mint_data.get("expires_at", "")
 

@@ -7,7 +7,7 @@ blueprint:
     human-in-the-loop approvals).
 
     Android Companion Features Included:
-      - Per-Machine Notification Channels (`OOB: <hostname>`) & Grouping (`oob_<hostname>`)
+      - Per-Machine Notification Channels (`OOB: <hostname>`, `OOB GATE UPDATE: <hostname>`)
       - True Un-Swipeable Pending State (`persistent: true`, `sticky: true`, `clickAction: noAction`, plus automatic re-pinning on `mobile_app_notification_cleared` if swiped on Android 14+)
       - Live Countdown Timer (`chronometer: true`, `when_relative: true`) in notification header
       - Dynamic Material Design Icons (`notification_icon`) & Accent Colors (`color`) per module
@@ -230,7 +230,6 @@ actions:
             data:
               tag: "{{ notif_tag }}"
               channel: "{{ notif_channel }}"
-              group: "{{ notif_group }}"
               importance: high
               priority: high
               ttl: 0
@@ -378,6 +377,7 @@ actions:
                 tag: "{{ notif_tag }}"
                 channel: "{{ notif_channel }}"
                 alert_once: true
+                live_update: false
                 persistent: false
                 sticky: false
                 chronometer: false
@@ -403,6 +403,7 @@ actions:
             tag: "{{ notif_tag }}"
             channel: "{{ notif_channel }}"
             alert_once: true
+            live_update: false
             persistent: false
             sticky: false
             chronometer: false

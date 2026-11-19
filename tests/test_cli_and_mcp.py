@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib
+import importlib.util
 import io
 import json
 import os
@@ -103,7 +104,7 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
         init_resp = handle_mcp_jsonrpc_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, self.config)
         self.assertEqual(init_resp["result"]["serverInfo"]["name"], "ha-oob-gate")
         self.assertEqual(init_resp["result"]["serverInfo"]["version"], __version__)
-        self.assertEqual(__version__, "5.1.0")
+        self.assertEqual(__version__, "5.2.0")
 
         list_resp = handle_mcp_jsonrpc_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, self.config)
         tool_names = {t["name"] for t in list_resp["result"]["tools"]}
@@ -314,6 +315,100 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
         self.assertEqual(cfg["module_config"]["github_token"]["installation_id"], "")
         self.assertEqual(cfg["module_config"]["github_token"]["default_repo_policy"], "oob")
         self.assertIn("https://github.com/settings/apps/new", render_manifest_html())
+
+    def test_github_workflows_cli_mcp_manifest_and_blueprint_group_fix(self) -> None:
+        import ha_oob_gate.cli as cli_mod
+        from ha_oob_gate.setup_github_app import build_app_manifest
+
+        # 1. Manifest grants workflows: write to token-broker, never to repo-creator
+        self.assertEqual(build_app_manifest(role="token-broker")["default_permissions"].get("workflows"), "write")
+        self.assertNotIn("workflows", build_app_manifest(role="repo-creator")["default_permissions"])
+
+        # 2. CLI `--workflows` passes `workflows=True` in params and prints clean stdout
+        seen_payloads = []
+
+        def fake_sock(sock_path, payload, timeout):
+            seen_payloads.append(payload)
+            return {
+                "status": "approved",
+                "request_id": "req-gh-wf-1",
+                "caller_nonce": "cnonce-gh-wf-1",
+                "token": "ghs_workflows_tok",
+            }
+
+        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.runtime_dir}, clear=False):
+            with patch("ha_oob_gate.cli.load_config", return_value=self.config):
+                out_gh, err_gh = io.StringIO(), io.StringIO()
+                with patch("ha_oob_gate.cli.send_unix_socket_request", side_effect=fake_sock):
+                    with redirect_stdout(out_gh), redirect_stderr(err_gh):
+                        with self.assertRaises(SystemExit) as cm:
+                            cli_mod.main([
+                                "github-token",
+                                "--repo",
+                                "Locknes/absorb",
+                                "--permission",
+                                "write",
+                                "--workflows",
+                                "--reason",
+                                "Add CI workflow",
+                            ])
+                        self.assertEqual(cm.exception.code, 0)
+        self.assertEqual(out_gh.getvalue(), "ghs_workflows_tok\n")
+        self.assertIn("WRITE+WORKFLOWS", err_gh.getvalue())
+        self.assertTrue(seen_payloads[-1]["params"]["workflows"])
+
+        # 3. MCP `oob_github_token` forwards `workflows=True`
+        mcp_calls = []
+        mcp_resp = handle_mcp_jsonrpc_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "oob_github_token",
+                    "arguments": {
+                        "repo": "Locknes/absorb",
+                        "permission": "write",
+                        "workflows": True,
+                        "reason": "Add CI workflow",
+                    },
+                },
+            },
+            self.config,
+            socket_requester=lambda s, p, t: (mcp_calls.append(p) or {"status": "approved", "token": "ghs_mcp_wf"}),
+        )
+        self.assertFalse(mcp_resp["result"]["isError"])
+        self.assertTrue(mcp_calls[-1]["params"]["workflows"])
+
+        # 4. Blueprint omits `group:` on mobile notifications and clears `live_update: false` on Deny/Timeout
+        bp_text = (Path(REPO_ROOT) / "homeassistant" / "universal_oob_auth_blueprint.yaml").read_text(encoding="utf-8")
+        actions_section = bp_text.split("\nactions:\n", 1)[1]
+        self.assertNotIn("group:", actions_section)
+        self.assertEqual(actions_section.count("live_update: false"), 2)
+
+        if importlib.util.find_spec("yaml") is not None:
+            import yaml
+
+            class _HaSafeLoader(yaml.SafeLoader):
+                pass
+
+            for tag in ("!input", "!secret"):
+                _HaSafeLoader.add_constructor(tag, lambda loader, node: f"{node.tag}:{node.value}")
+
+            bp = yaml.load(bp_text, Loader=_HaSafeLoader)
+
+            def walk(obj):
+                if isinstance(obj, dict):
+                    if obj.get("action") == "{{ notify_action }}":
+                        nested = (obj.get("data") or {}).get("data") or {}
+                        self.assertNotIn("group", nested)
+                    for v in obj.values():
+                        walk(v)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        walk(item)
+
+            walk(bp["actions"])
 
 
 if __name__ == "__main__":

@@ -399,6 +399,68 @@ class TestGitHubRepoCreateModule(unittest.TestCase):
         self.assertLess(idx_attach_creator, idx_topics)
         self.assertLess(idx_topics, idx_attach_broker)
 
+    def test_mint_token_workflows_validation_and_permission_scope(self) -> None:
+        # 1. `workflows=True` without `mint_token=True` fails validation cleanly
+        bad = self.engine.submit_and_wait(
+            "github_repo_create",
+            {"repo": "Locknes/ci-demo", "mint_token": False, "workflows": True, "reason": "bad"},
+            self.caller,
+            wait_seconds=0,
+        )
+        self.assertEqual(bad["code"], 403)
+
+        # 2. `workflows=True` + `mint_token=True` requests `workflows: write` after approval
+        with open(self.oauth_path, "w", encoding="utf-8") as f:
+            json.dump({"client_id": "IvDemo", "access_token": "ghu_demo_oauth"}, f)
+
+        mint_calls = []
+
+        def fake_gh(url, token, method="GET", payload=None):
+            if url.endswith("/app/installations"):
+                return 200, [{"id": 101, "repository_selection": "all", "account": {"login": "Locknes", "type": "User"}}]
+            if url.endswith("/user") and method == "GET":
+                return 200, {"login": "Locknes"}
+            if url.endswith("/repos/Locknes/ci-demo") and method == "GET":
+                return 404, {}
+            if url.endswith("/user/repos") and method == "POST":
+                return 201, {"id": 99901, "full_name": "Locknes/ci-demo", "private": False}
+            if url.endswith("/repos/Locknes/ci-demo/topics") and method == "PUT":
+                return 200, {"names": payload["names"]}
+            if url.endswith("/app/installations/101/access_tokens") and method == "POST":
+                mint_calls.append(payload)
+                return 201, {"token": "ghs_repo_create_wf", "expires_at": "2026-11-19T08:00:00Z"}
+            return 500, {}
+
+        webhooks = []
+        with patch("ha_oob_gate.modules.github_repo_create.create_github_app_jwt", return_value="fake.jwt.sig"):
+            with patch("ha_oob_gate.modules.github_repo_create._github_api_request", side_effect=fake_gh):
+                with patch("ha_oob_gate.daemon.trigger_ha_webhook", side_effect=lambda cfg, p: (webhooks.append(p) or True)):
+                    pending = self.engine.submit_and_wait(
+                        "github_repo_create",
+                        {
+                            "repo": "Locknes/ci-demo",
+                            "visibility": "public",
+                            "mint_token": True,
+                            "workflows": True,
+                            "reason": "create with workflow CI",
+                        },
+                        self.caller,
+                        wait_seconds=0,
+                    )
+                    self.assertEqual(pending["status"], "pending")
+                    req_id = pending["request_id"]
+                    self.engine.handle_ha_callback(
+                        req_id, webhooks[0]["approve_nonce"], "approve", "192.0.2.10", "secret-approval-token"
+                    )
+                    resolved = self.engine.wait_for_resolution(req_id, timeout=5.0)
+
+        self.assertEqual(resolved["status"], "approved")
+        self.assertTrue(resolved["workflows"])
+        self.assertEqual(
+            mint_calls[-1]["permissions"],
+            {"metadata": "read", "contents": "write", "pull_requests": "write", "workflows": "write"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

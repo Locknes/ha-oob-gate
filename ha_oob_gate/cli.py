@@ -628,8 +628,35 @@ def cmd_secret_checkout(args: argparse.Namespace, config: Dict[str, Any]) -> Non
     sys.exit(1)
 
 
+def _save_gh_lease(resp: Dict[str, Any]) -> None:
+    """Persist single-repo GitHub token lease metadata so `oob-auth revoke` can revoke it."""
+    if not (resp.get("request_id") and resp.get("caller_nonce")):
+        return
+    try:
+        gh_lease_path = _runtime_file_path(".jit-gh-lease.json", create_dir=True)
+        gflags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        gfd = os.open(gh_lease_path, gflags, 0o600)
+        try:
+            os.fchmod(gfd, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(gfd, "w", encoding="utf-8") as gf:
+            json.dump(
+                {
+                    "request_id": resp.get("request_id", ""),
+                    "caller_nonce": resp.get("caller_nonce", ""),
+                    "transport": "unix",
+                },
+                gf,
+            )
+    except OSError:
+        pass
+
+
 def cmd_github_token(args: argparse.Namespace, config: Dict[str, Any]) -> None:
-    sys.stderr.write(f"[oob-auth] 🐙 Requesting GitHub {args.permission.upper()} token for {args.repo}...\n")
+    workflows = bool(getattr(args, "workflows", False))
+    perm_label = "WRITE+WORKFLOWS" if workflows else args.permission.upper()
+    sys.stderr.write(f"[oob-auth] 🐙 Requesting GitHub {perm_label} token for {args.repo}...\n")
     sys.stderr.flush()
     resp = send_unix_socket_request(
         config["socket_path"],
@@ -639,14 +666,16 @@ def cmd_github_token(args: argparse.Namespace, config: Dict[str, Any]) -> None:
             "params": {
                 "repo": args.repo,
                 "permission": args.permission,
+                "workflows": workflows,
                 "reason": args.reason,
             },
         },
         timeout=float(config["timeout_seconds"]) + 15,
     )
     if resp.get("status") == "approved" and resp.get("token"):
+        _save_gh_lease(resp)
         mode_note = "auto-approved via repo tag" if resp.get("auto_approved") else "approved via Home Assistant"
-        sys.stderr.write(f"[oob-auth] ✅ GitHub {args.permission} token granted ({mode_note}).\n")
+        sys.stderr.write(f"[oob-auth] ✅ GitHub {perm_label.lower()} token granted ({mode_note}).\n")
         sys.stdout.write(f"{resp['token']}\n")
         sys.exit(0)
     sys.stderr.write(f"[oob-auth] ❌ GitHub token request {resp.get('status', 'denied')}: {resp.get('message', '')}\n")
@@ -672,6 +701,7 @@ def cmd_github_create_repo(args: argparse.Namespace, config: Dict[str, Any]) -> 
                 "oob_tier": args.oob_tier,
                 "topics": args.topics or [],
                 "mint_token": bool(args.mint_token),
+                "workflows": bool(getattr(args, "workflows", False)),
                 "reason": args.reason,
             },
         },
@@ -683,22 +713,7 @@ def cmd_github_create_repo(args: argparse.Namespace, config: Dict[str, Any]) -> 
             f"(topics: {', '.join(resp.get('topics') or [])}).\n"
         )
         if args.mint_token and resp.get("token"):
-            gh_lease_path = _runtime_file_path(".jit-gh-lease.json", create_dir=True)
-            gflags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-            gfd = os.open(gh_lease_path, gflags, 0o600)
-            try:
-                os.fchmod(gfd, 0o600)
-            except OSError:
-                pass
-            with os.fdopen(gfd, "w", encoding="utf-8") as gf:
-                json.dump(
-                    {
-                        "request_id": resp.get("request_id", ""),
-                        "caller_nonce": resp.get("caller_nonce", ""),
-                        "transport": "unix",
-                    },
-                    gf,
-                )
+            _save_gh_lease(resp)
             sys.stderr.write("[oob-auth] 🔑 Minted 1-hour single-repo GitHub App push token.\n")
             sys.stdout.write(f"{resp['token']}\n")
         else:
@@ -1013,6 +1028,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         p_gh = sub.add_parser("github-token", help="Request a tag-evaluated GitHub App single-repo token or Vault PAT")
         p_gh.add_argument("--repo", required=True, help="Target repository in 'owner/repo' format")
         p_gh.add_argument("--permission", default="write", choices=["read", "write"], help="Requested permission level")
+        p_gh.add_argument(
+            "--workflows",
+            action="store_true",
+            help="Also request GitHub Actions 'workflows: write' permission (always requires OOB phone approval)",
+        )
         p_gh.add_argument("--reason", default="Git repository operation", help="Reason for GitHub access")
 
         p_ghc = sub.add_parser(
@@ -1043,6 +1063,11 @@ def main(argv: Optional[list[str]] = None) -> None:
             "--mint-token",
             action="store_true",
             help="Also mint a 1-hour single-repo GitHub App push token and print it on stdout",
+        )
+        p_ghc.add_argument(
+            "--workflows",
+            action="store_true",
+            help="With --mint-token, include 'workflows: write' on the minted 1-hour push token",
         )
         p_ghc.add_argument("--reason", required=True, help="Reason for creating this repository")
 

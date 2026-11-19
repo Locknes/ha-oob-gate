@@ -641,6 +641,84 @@ class TestDaemonEngineAndIPC(unittest.TestCase):
         self.assertEqual(parsed["nested"]["token"], "[REDACTED]")
         self.assertEqual(parsed["nested"]["safe_field"], "visible_value")
 
+    def test_github_token_workflows_never_auto_approves_and_mints_workflows_perm(self) -> None:
+        caller = CallerInfo(uid=1001, gid=1001, pid=4040, username="dev-agent", is_root=False)
+        fake_pem_path = os.path.join(self.tmp_dir.name, "fake_gh.pem")
+        with open(fake_pem_path, "w", encoding="utf-8") as f:
+            f.write("-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n")
+
+        gh_cfg = dict(self.config)
+        gh_cfg["module_config"] = {
+            "github_token": {
+                "app_id": "12345",
+                "installation_id": "999",
+                "private_key_path": fake_pem_path,
+                "allow_vault_pat_fallback": False,
+                "default_repo_policy": "deny",
+            }
+        }
+        gh_engine = GateEngine(gh_cfg)
+
+        # 1. `--workflows` requires `--permission write`
+        bad_res = gh_engine.submit_and_wait(
+            "github_token",
+            {"repo": "org/auto", "permission": "read", "workflows": True, "reason": "bad read wf"},
+            caller,
+            wait_seconds=0,
+        )
+        self.assertEqual(bad_res["code"], 403)
+
+        mint_payloads = []
+
+        def fake_gh_api(url, token, method="GET", payload=None):
+            if url.endswith("/access_tokens") and method == "POST":
+                mint_payloads.append(payload)
+                return 201, {"token": "ghs_minted_tok", "expires_at": "2026-11-19T08:00:00Z"}
+            if url.endswith("/topics"):
+                return 200, {"names": ["oob-write"]}
+            if url.endswith("/properties/values"):
+                return 200, []
+            return 204, {}
+
+        with patch("ha_oob_gate.modules.github_token.create_github_app_jwt", return_value="fake.jwt.sig"):
+            with patch("ha_oob_gate.modules.github_token._github_api_request", side_effect=fake_gh_api):
+                # 2. Without `workflows`, `oob-write` still auto-approves cleanly WITHOUT `workflows` perm
+                normal_res = gh_engine.submit_and_wait(
+                    "github_token",
+                    {"repo": "org/auto", "permission": "write", "reason": "normal push"},
+                    caller,
+                    wait_seconds=0,
+                )
+                self.assertEqual(normal_res["status"], "approved")
+                self.assertTrue(normal_res["auto_approved"])
+                self.assertNotIn("workflows", mint_payloads[-1]["permissions"])
+
+                # 3. With `workflows=True`, even `oob-write` MUST require OOB phone approval
+                webhooks = []
+                with patch("ha_oob_gate.daemon.trigger_ha_webhook", side_effect=lambda c, p: (webhooks.append(p) or True)):
+                    pending = gh_engine.submit_and_wait(
+                        "github_token",
+                        {"repo": "org/auto", "permission": "write", "workflows": True, "reason": "add ci"},
+                        caller,
+                        wait_seconds=0,
+                    )
+                    self.assertEqual(pending["code"], 202)
+                    self.assertEqual(pending["status"], "pending")
+                    self.assertIn("WRITE+WORKFLOWS", webhooks[-1]["title"])
+                    self.assertEqual(webhooks[-1]["color"], "#F59E0B")
+                    self.assertEqual(webhooks[-1]["icon"], "mdi:cog-play-outline")
+
+                    req_id = pending["request_id"]
+                    gh_engine.handle_ha_callback(req_id, webhooks[-1]["approve_nonce"], "approve", "192.0.2.10")
+                    resolved = gh_engine.wait_for_resolution(req_id, timeout=5.0)
+
+        self.assertEqual(resolved["status"], "approved")
+        self.assertTrue(resolved["workflows"])
+        self.assertEqual(
+            mint_payloads[-1]["permissions"],
+            {"metadata": "read", "contents": "write", "pull_requests": "write", "workflows": "write"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
