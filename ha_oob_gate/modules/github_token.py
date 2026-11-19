@@ -229,6 +229,11 @@ class GitHubTokenGateModule(BaseGateModule):
             return False, "permission must be 'read' or 'write'"
         params["permission"] = perm
 
+        workflows = bool(params.get("workflows", False))
+        if workflows and perm != "write":
+            return False, "--workflows requires --permission write"
+        params["workflows"] = workflows
+
         gh_cfg = self._get_gh_config(config)
         app_id = gh_cfg["app_id"]
         key_path = gh_cfg["private_key_path"]
@@ -285,6 +290,9 @@ class GitHubTokenGateModule(BaseGateModule):
                 requested_permission=perm,
                 default_policy=gh_cfg["default_repo_policy"],
             )
+            if decision != "deny" and workflows and decision == "auto":
+                decision = "oob"
+                policy_reason = "Workflow modification (--workflows) always requires Home Assistant OOB phone approval"
             params["_gh_mode"] = "app"
             params["_gh_inst_id"] = inst_id
             params["_gh_decision"] = decision
@@ -309,6 +317,8 @@ class GitHubTokenGateModule(BaseGateModule):
         )
 
     def can_auto_approve(self, params: Dict[str, Any], caller: CallerInfo, config: Dict[str, Any]) -> bool:
+        if params.get("workflows"):
+            return False
         return params.get("_gh_mode") == "app" and params.get("_gh_decision") == "auto"
 
     def format_notification(
@@ -321,9 +331,32 @@ class GitHubTokenGateModule(BaseGateModule):
     ) -> NotificationSpec:
         repo_full = sanitize_text(params.get("repo", ""), max_len=100)
         perm = sanitize_text(params.get("permission", "write"), max_len=16).upper()
+        workflows = bool(params.get("workflows", False))
         mode = "GitHub App (1h Single-Repo)" if params.get("_gh_mode") == "app" else "Root Vault PAT (One-Shot)"
         reason = sanitize_text(params.get("reason", f"Git {perm} on {repo_full}"), max_len=200)
         tags_str = ", ".join(params.get("_gh_topics") or []) or "none"
+
+        if workflows:
+            return NotificationSpec(
+                title=f"⚠️ GitHub WRITE+WORKFLOWS: {repo_full} [{verify_code}]",
+                message=(
+                    f"⚠️ ELEVATED CI WORKFLOW ACCESS (.github/workflows)\n"
+                    f"Caller: {caller.username}@{hostname}\n"
+                    f"Repo: {repo_full}\n"
+                    f"Access: {perm} + WORKFLOWS ({mode})\n"
+                    f"Repo Tags: {tags_str}\n"
+                    f"Reason: {reason}"
+                ),
+                approve_title=f"Approve (WRITE+WF) [{verify_code}]",
+                deny_title="Deny",
+                approved_title=f"✅ GitHub WRITE+WORKFLOWS Approved [{verify_code}]",
+                approved_message=f"Granted {mode} WRITE + WORKFLOWS access to {repo_full}.",
+                denied_title=f"🛑 GitHub WRITE+WORKFLOWS Denied [{verify_code}]",
+                denied_message=f"Denied WRITE + WORKFLOWS access to {repo_full}.",
+                command_summary=f"github-token write --workflows {repo_full} ({reason})",
+                icon="mdi:cog-play-outline",
+                color="#F59E0B",
+            )
 
         title = f"🐙 GitHub {perm}: {repo_full} [{verify_code}]"
         message = (
@@ -356,6 +389,7 @@ class GitHubTokenGateModule(BaseGateModule):
         gh_cfg = self._get_gh_config(config)
         repo_full = params["repo"]
         perm = params.get("permission", "write")
+        workflows = bool(params.get("workflows", False))
 
         if params.get("_gh_mode") == "app":
             app_jwt = create_github_app_jwt(gh_cfg["app_id"], private_key_path=gh_cfg["private_key_path"])
@@ -366,6 +400,8 @@ class GitHubTokenGateModule(BaseGateModule):
             if perm == "write":
                 gh_perms["contents"] = "write"
                 gh_perms["pull_requests"] = "write"
+                if workflows:
+                    gh_perms["workflows"] = "write"
 
             code, tok_data = _github_api_request(
                 f"{gh_cfg['api_url']}/app/installations/{inst_id}/access_tokens",
@@ -377,12 +413,18 @@ class GitHubTokenGateModule(BaseGateModule):
                 },
             )
             if code != 201 or not tok_data.get("token"):
-                raise RuntimeError(f"GitHub App token mint failed (HTTP {code}): {tok_data.get('message', '')}")
+                hint = (
+                    " (ensure 'Workflows: Read and write' is enabled on the GitHub App AND accepted on the installation)"
+                    if workflows and code == 422
+                    else ""
+                )
+                raise RuntimeError(f"GitHub App token mint failed (HTTP {code}): {tok_data.get('message', '')}{hint}")
 
             return {
                 "mode": "github_app",
                 "repo": repo_full,
                 "permission": perm,
+                "workflows": workflows,
                 "token": tok_data["token"],
                 "expires_at": tok_data.get("expires_at", ""),
                 "policy_reason": params.get("_gh_policy_reason", ""),
@@ -395,6 +437,7 @@ class GitHubTokenGateModule(BaseGateModule):
             "mode": "vault_pat",
             "repo": repo_full,
             "permission": perm,
+            "workflows": workflows,
             "token": pat,
             "policy_reason": params.get("_gh_policy_reason", ""),
         }

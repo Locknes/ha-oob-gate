@@ -4,4 +4,4 @@ ha_oob_gate - Modular Out-of-Band Authorization, PAM 2FA & MCP Gateway for Home 
 
 from __future__ import annotations
 
-__version__ = "5.1.0"
+__version__ = "5.2.0"
