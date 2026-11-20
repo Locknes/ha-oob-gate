@@ -587,6 +587,104 @@ class TestDaemonEngineAndIPC(unittest.TestCase):
         self.assertTrue(any("/clusterrolebindings/jit-oob-12345678aaaa" in p for p in delete_paths))
         self.assertTrue(any("/serviceaccounts/jit-oob-12345678aaaa" in p for p in delete_paths))
 
+    def test_k8s_token_allow_pvcs_validation_encoding_and_cel_pinning(self) -> None:
+        caller = CallerInfo(uid=1001, gid=1001, pid=4025, username="dev-agent", is_root=False)
+        k8s_mod = self.engine.modules["k8s_token"]
+
+        # 1. Adversarial & invalid allow_pvcs inputs must be rejected fail-closed
+        bad_cases = [
+            {"role": "view", "namespaces": ["media-servers"], "allow_pvcs": ["pvc-app-data"], "reason": "view with pvc"},
+            {"role": "jit-workload-operator", "namespaces": ["media-servers"], "allow_pvcs": ["pvc--inject"], "reason": "double dash"},
+            {"role": "jit-workload-operator", "namespaces": ["media-servers"], "allow_pvcs": ["*"], "reason": "wildcard"},
+            {"role": "jit-workload-operator", "namespaces": ["media-servers"], "allow_pvcs": ["BadUpper"], "reason": "uppercase"},
+            {"role": "jit-workload-operator", "namespaces": ["media-servers"], "allow_pvcs": ["../secret"], "reason": "path"},
+            {"role": "jit-workload-operator", "namespaces": ["media-servers"], "allow_pvcs": "pvc-str", "reason": "not a list"},
+            {
+                "role": "jit-workload-operator",
+                "namespaces": ["media-servers"],
+                "allow_pvcs": [f"pvc-{i}" for i in range(9)],
+                "reason": "too many pvcs",
+            },
+            {
+                "role": "jit-workload-operator",
+                "namespaces": ["media-servers"],
+                "allow_pvcs": ["a" * 50, "b" * 50, "c" * 50, "d" * 50, "e" * 50],
+                "reason": "sa exceeds 253 chars",
+            },
+        ]
+        for params in bad_cases:
+            ok, _ = k8s_mod.validate(params, caller, self.config)
+            self.assertFalse(ok, f"Expected allow_pvcs validation failure for: {params}")
+
+        # 2. Valid allow_pvcs passes validation, formats explicit phone prompt, and pins exact SA name
+        valid_params = {
+            "role": "jit-workload-operator",
+            "namespaces": ["media-servers"],
+            "allow_pvcs": ["pvc-bunkr-browser-data", "pvc-cache", "pvc-bunkr-browser-data"],
+            "reason": "Deploy bunkr-browser",
+        }
+        self.assertTrue(k8s_mod.validate(valid_params, caller, self.config)[0])
+
+        notif = k8s_mod.format_notification(valid_params, caller, "ABCD", "bastion", self.config)
+        self.assertIn("+ PVC", notif.title)
+        self.assertIn("Allowed PVCs: pvc-bunkr-browser-data, pvc-cache", notif.message)
+        self.assertIn("PVCs: pvc-bunkr-browser-data, pvc-cache", notif.approved_message)
+
+        created_bodies = []
+
+        def fake_k8s_api(method, path, body=None, config=None, override_token=None):
+            created_bodies.append((method, path, body))
+            if method == "POST" and path.endswith("/token"):
+                return {"status": {"token": "jwt-pvc-pinned"}}
+            return {}
+
+        expected_sa = "jit-oob-12345678aaaa--pvc--pvc-bunkr-browser-data--pvc--pvc-cache--end"
+        with patch("ha_oob_gate.modules.k8s_token.k8s_api_request", side_effect=fake_k8s_api):
+            granted = k8s_mod.grant(
+                req_id="12345678-aaaa-4bbb-8ccc-1234567890ab",
+                params=valid_params,
+                caller=caller,
+                ttl_seconds=600,
+                config=self.config,
+            )
+            self.assertEqual(granted["sa_name"], expected_sa)
+            self.assertEqual(granted["allowed_pvcs"], ["pvc-bunkr-browser-data", "pvc-cache"])
+            sa_post = [b for m, p, b in created_bodies if m == "POST" and p.endswith("/serviceaccounts")][0]
+            self.assertEqual(sa_post["metadata"]["name"], expected_sa)
+            self.assertEqual(
+                sa_post["metadata"]["annotations"]["oob.gate/allowed-pvcs"],
+                "pvc-bunkr-browser-data,pvc-cache",
+            )
+
+            # Revoke deletes the exact encoded SA and RoleBinding
+            k8s_mod.revoke("12345678-aaaa-4bbb-8ccc-1234567890ab", granted, self.config)
+
+        delete_paths = [p for m, p, _ in created_bodies if m == "DELETE"]
+        self.assertTrue(any(f"/namespaces/media-servers/rolebindings/{expected_sa}" in p for p in delete_paths))
+        self.assertTrue(any(f"/serviceaccounts/{expected_sa}" in p for p in delete_paths))
+
+        # 3. Verify CEL exact-match predicate against prefix/suffix/unapproved/delimiter bypasses
+        username = f"system:serviceaccount:jit-system:{expected_sa}"
+
+        def cel_allows_pvc(user: str, claim: str) -> bool:
+            return (
+                user.startswith("system:serviceaccount:jit-system:jit-oob-")
+                and claim != ""
+                and "--" not in claim
+                and f"--pvc--{claim}--" in user
+            )
+
+        self.assertTrue(cel_allows_pvc(username, "pvc-bunkr-browser-data"))
+        self.assertTrue(cel_allows_pvc(username, "pvc-cache"))
+        self.assertFalse(cel_allows_pvc(username, "pvc-bunkr-browser"))
+        self.assertFalse(cel_allows_pvc(username, "bunkr-browser-data"))
+        self.assertFalse(cel_allows_pvc(username, "pvc-smb-plex-media"))
+        self.assertFalse(cel_allows_pvc(username, "pvc"))
+        self.assertFalse(cel_allows_pvc(username, "end"))
+        self.assertFalse(cel_allows_pvc(username, "pvc-bunkr-browser-data--pvc--pvc-cache"))
+        self.assertFalse(cel_allows_pvc("system:serviceaccount:jit-system:jit-oob-12345678aaaa", "pvc-bunkr-browser-data"))
+        self.assertFalse(cel_allows_pvc("system:serviceaccount:llm-games:svc-agy", "pvc-bunkr-browser-data"))
+
     def test_lease_eviction_and_audit_redaction_of_arbitrary_secret_keys(self) -> None:
         # 1. Lease capacity eviction revokes oldest lease outside engine.lock
         caller = CallerInfo(uid=1001, gid=1001, pid=4030, username="dev-agent", is_root=False)

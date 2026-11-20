@@ -104,7 +104,7 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
         init_resp = handle_mcp_jsonrpc_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, self.config)
         self.assertEqual(init_resp["result"]["serverInfo"]["name"], "ha-oob-gate")
         self.assertEqual(init_resp["result"]["serverInfo"]["version"], __version__)
-        self.assertEqual(__version__, "5.2.0")
+        self.assertEqual(__version__, "5.3.0")
 
         list_resp = handle_mcp_jsonrpc_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, self.config)
         tool_names = {t["name"] for t in list_resp["result"]["tools"]}
@@ -409,6 +409,67 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
                         walk(item)
 
             walk(bp["actions"])
+
+    def test_k8s_token_allow_pvc_cli_and_mcp_forwarding(self) -> None:
+        import ha_oob_gate.cli as cli_mod
+
+        seen_cli = []
+
+        def fake_sock(sock_path, payload, timeout):
+            seen_cli.append(payload)
+            return {
+                "status": "approved",
+                "request_id": "req-k8s-pvc-1",
+                "caller_nonce": "cnonce-k8s-pvc-1",
+                "token": "eyJhbGciOiJSUzI1NiJ9.pvc.jwt",
+                "service_account": "jit-system:jit-oob-123--pvc--pvc-a--pvc--pvc-b--end",
+                "allowed_pvcs": ["pvc-a", "pvc-b"],
+                "expires_at": "2026-11-20T20:00:00Z",
+            }
+
+        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.runtime_dir}, clear=False):
+            with patch("ha_oob_gate.cli.load_config", return_value=self.config):
+                out_k8s, err_k8s = io.StringIO(), io.StringIO()
+                with patch("ha_oob_gate.cli.send_unix_socket_request", side_effect=fake_sock):
+                    with redirect_stdout(out_k8s), redirect_stderr(err_k8s):
+                        cli_mod.main([
+                            "k8s-token",
+                            "--role",
+                            "jit-workload-operator",
+                            "--namespaces",
+                            "media-servers",
+                            "--allow-pvc",
+                            "pvc-a",
+                            "--allow-pvc",
+                            "pvc-b",
+                            "--reason",
+                            "Deploy with PVCs",
+                        ])
+        self.assertEqual(out_k8s.getvalue(), "export K8S_JIT_TOKEN=eyJhbGciOiJSUzI1NiJ9.pvc.jwt\n")
+        self.assertEqual(seen_cli[-1]["params"]["allow_pvcs"], ["pvc-a", "pvc-b"])
+        self.assertIn("AllowedPVCs: pvc-a, pvc-b", err_k8s.getvalue())
+
+        seen_mcp = []
+        mcp_resp = handle_mcp_jsonrpc_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "oob_k8s_token",
+                    "arguments": {
+                        "role": "jit-workload-operator",
+                        "namespaces": ["media-servers"],
+                        "allow_pvcs": ["pvc-bunkr-browser-data"],
+                        "reason": "Deploy bunkr-browser",
+                    },
+                },
+            },
+            self.config,
+            socket_requester=lambda s, p, t: (seen_mcp.append(p) or {"status": "approved", "token": "jwt-mcp"}),
+        )
+        self.assertFalse(mcp_resp["result"]["isError"])
+        self.assertEqual(seen_mcp[-1]["params"]["allow_pvcs"], ["pvc-bunkr-browser-data"])
 
 
 if __name__ == "__main__":

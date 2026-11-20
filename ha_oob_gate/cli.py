@@ -465,6 +465,8 @@ def _save_k8s_lease(
         )
     sys.stderr.write(f"[oob-auth] ✅ Approved! Temporary JWT saved to {token_out_path} (0600)\n")
     sys.stderr.write(f"[oob-auth]    ServiceAcct: {pdata.get('service_account')}\n")
+    if pdata.get("allowed_pvcs"):
+        sys.stderr.write(f"[oob-auth]    AllowedPVCs: {', '.join(pdata['allowed_pvcs'])}\n")
     sys.stderr.write(f"[oob-auth]    Expires at : {pdata.get('expires_at')}\n")
     sys.stderr.write(f"[oob-auth]    Usage      : kubectl --token=\"$(cat {token_out_path})\" ...\n")
     sys.stderr.write("[oob-auth]    Revoke     : oob-auth revoke\n")
@@ -478,19 +480,27 @@ def _save_k8s_lease(
 
 
 def cmd_k8s_token(args: argparse.Namespace, config: Dict[str, Any]) -> None:
+    allow_pvcs = list(getattr(args, "allow_pvc", None) or [])
+    pvc_note = f" (allow PVCs: {', '.join(allow_pvcs)})" if allow_pvcs else ""
+    req_params: Dict[str, Any] = {
+        "role": args.role,
+        "namespaces": args.namespaces,
+        "reason": args.reason,
+    }
+    if allow_pvcs:
+        req_params["allow_pvcs"] = allow_pvcs
+
     if not args.broker_url and os.path.exists(config["socket_path"]):
-        sys.stderr.write(f"[oob-auth] 📱 Requesting mobile approval for K8s role '{args.role}' in {args.namespaces}...\n")
+        sys.stderr.write(
+            f"[oob-auth] 📱 Requesting mobile approval for K8s role '{args.role}' in {args.namespaces}{pvc_note}...\n"
+        )
         sys.stderr.flush()
         resp = send_unix_socket_request(
             config["socket_path"],
             {
                 "action": "module_request",
                 "module": "k8s_token",
-                "params": {
-                    "role": args.role,
-                    "namespaces": args.namespaces,
-                    "reason": args.reason,
-                },
+                "params": req_params,
             },
             timeout=float(args.timeout or config.get("timeout_seconds", 900)) + 15,
         )
@@ -514,11 +524,7 @@ def cmd_k8s_token(args: argparse.Namespace, config: Dict[str, Any]) -> None:
     req_body = json.dumps(
         {
             "module": "k8s_token",
-            "params": {
-                "role": args.role,
-                "namespaces": args.namespaces,
-                "reason": args.reason,
-            },
+            "params": req_params,
         }
     ).encode("utf-8")
 
@@ -1021,6 +1027,13 @@ def main(argv: Optional[list[str]] = None) -> None:
             choices=["view", "jit-workload-operator", "jit-storage-operator"],
         )
         p_k8s.add_argument("--namespaces", nargs="+", default=["default"])
+        p_k8s.add_argument(
+            "--allow-pvc",
+            action="extend",
+            nargs="+",
+            default=[],
+            help="Optional exact PVC claimName(s) pinned into the ephemeral SA for CEL-guarded Pod/Deployment mounts",
+        )
         p_k8s.add_argument("--reason", required=True)
         p_k8s.add_argument("--timeout", type=int, default=300)
         p_k8s.add_argument("--raw", action="store_true", help="Print bare JWT on stdout instead of `export K8S_JIT_TOKEN=...`")

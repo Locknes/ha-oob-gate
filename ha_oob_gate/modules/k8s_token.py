@@ -10,6 +10,7 @@ ServiceAccount + RoleBindings upon TTL expiry or `oob-auth revoke`.
 from __future__ import annotations
 
 import datetime
+import re
 import time
 from typing import Any, Dict, List, Tuple
 
@@ -30,6 +31,59 @@ DEFAULT_PROTECTED_NAMESPACES = {
     "kube-node-lease",
     "cert-manager",
 }
+
+# DNS-1123 subdomain regex matching valid Kubernetes PersistentVolumeClaim names
+PVC_NAME_REGEX = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$"
+)
+MAX_ALLOWED_PVCS = 8
+MAX_SA_NAME_LENGTH = 253
+
+
+def _normalize_allow_pvcs(raw: Any) -> Tuple[bool, List[str], str]:
+    """Validate and deduplicate optional `allow_pvcs` PVC claimName allowlist."""
+    if raw is None or raw == []:
+        return True, [], "ok"
+    if not isinstance(raw, list):
+        return False, [], "allow_pvcs must be a list of PersistentVolumeClaim names"
+    cleaned: List[str] = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            return False, [], "allow_pvcs entries must be non-empty strings"
+        name = item.strip()
+        if "--" in name:
+            return (
+                False,
+                [],
+                f"PVC claimName '{name}' cannot contain '--' (reserved delimiter for CEL guardrail pinning)",
+            )
+        if not PVC_NAME_REGEX.fullmatch(name) or len(name) > 200:
+            return (
+                False,
+                [],
+                f"Invalid PVC claimName '{name}': must be a valid lowercase DNS-1123 name without wildcards",
+            )
+        if name not in seen:
+            seen.add(name)
+            cleaned.append(name)
+    if len(cleaned) > MAX_ALLOWED_PVCS:
+        return False, [], f"At most {MAX_ALLOWED_PVCS} PVCs may be pinned in a single k8s_token grant"
+    return True, cleaned, "ok"
+
+
+def build_jit_sa_name(sa_prefix: str, short_id: str, allow_pvcs: List[str]) -> str:
+    """
+    Build the ephemeral ServiceAccount name in `jit-system`.
+    When `allow_pvcs` is empty, preserves legacy `<prefix><short_id>` (zero PVC mounts permitted).
+    When `allow_pvcs` is non-empty, encodes each exact claimName as `--pvc--<claimName>` terminated
+    by `--end` so kube-apiserver CEL guardrails can verify exact claim membership without spoofing.
+    """
+    base = f"{sa_prefix}{short_id}"
+    if not allow_pvcs:
+        return base
+    encoded = "".join(f"--pvc--{pvc}" for pvc in allow_pvcs)
+    return f"{base}{encoded}--end"
 
 
 class K8sTokenModule(BaseGateModule):
@@ -61,6 +115,21 @@ class K8sTokenModule(BaseGateModule):
                 )
             if clean_ns in protected_ns or clean_ns.startswith("kube-"):
                 return False, f"Namespace '{clean_ns}' is a protected control-plane namespace and cannot be targeted"
+
+        pvc_ok, allow_pvcs, pvc_err = _normalize_allow_pvcs(params.get("allow_pvcs"))
+        if not pvc_ok:
+            return False, pvc_err
+        if allow_pvcs and role == "view":
+            return False, "allow_pvcs cannot be combined with read-only 'view' role"
+        if allow_pvcs:
+            sa_prefix = str(config.get("k8s_jit_sa_prefix", "jit-oob-"))
+            candidate_sa = build_jit_sa_name(sa_prefix, "0" * 12, allow_pvcs)
+            if len(candidate_sa) > MAX_SA_NAME_LENGTH:
+                return (
+                    False,
+                    f"Encoded ServiceAccount name for allow_pvcs exceeds Kubernetes {MAX_SA_NAME_LENGTH}-char limit",
+                )
+
         if not reason:
             return False, "A human-readable --reason is required"
         if len(reason) > 300:
@@ -77,19 +146,26 @@ class K8sTokenModule(BaseGateModule):
     ) -> NotificationSpec:
         role = sanitize_text(params.get("role", "jit-workload-operator"), max_len=64)
         namespaces: List[str] = params.get("namespaces", [])
+        _, allow_pvcs, _ = _normalize_allow_pvcs(params.get("allow_pvcs"))
         reason = sanitize_text(params.get("reason", "Maintenance"), max_len=250)
         max_ttl = int(config.get("k8s_ttl_seconds", self.default_ttl_seconds))
         eff_ttl = max(60, min(int(params.get("ttl_seconds") or max_ttl), max_ttl))
         ttl_min = max(1, eff_ttl // 60)
 
         ns_display = sanitize_text(", ".join(namespaces), max_len=200)
-        title = f"🔐 K8s JIT Token ({role}) [{verify_code}]"
+        pvc_display = sanitize_text(", ".join(allow_pvcs), max_len=200) if allow_pvcs else ""
+        title_role = f"{role} + PVC" if allow_pvcs else role
+        title = f"🔐 K8s JIT Token ({title_role}) [{verify_code}]"
         caller_disp = caller.k8s_identity or caller.username
+
+        pvc_line = f"Allowed PVCs: {pvc_display}\n" if allow_pvcs else ""
+        pvc_suffix = f" (PVCs: {pvc_display})" if allow_pvcs else ""
 
         message = (
             f"Caller: {caller_disp}\n"
             f"Role: {role}\n"
             f"Namespaces: {ns_display}\n"
+            f"{pvc_line}"
             f"Lease TTL: {ttl_min} minutes\n\n"
             f"Reason:\n{reason}"
         )
@@ -99,12 +175,12 @@ class K8sTokenModule(BaseGateModule):
             approve_title=f"Grant {ttl_min}m [{verify_code}]",
             deny_title="Deny",
             approved_title=f"✅ K8s Token Granted [{verify_code}]",
-            approved_message=f"Minted {ttl_min}m {role} token in [{ns_display}] for {reason}",
+            approved_message=f"Minted {ttl_min}m {role} token in [{ns_display}]{pvc_suffix} for {reason}",
             denied_title=f"❌ K8s Token Denied [{verify_code}]",
-            denied_message=f"Rejected {role} in [{ns_display}]",
+            denied_message=f"Rejected {role} in [{ns_display}]{pvc_suffix}",
             timeout_title=f"⏱️ K8s Token Timed Out [{verify_code}]",
-            timeout_message=f"Expired without response: {role} in [{ns_display}]",
-            command_summary=f"{role} on {ns_display}: {reason}",
+            timeout_message=f"Expired without response: {role} in [{ns_display}]{pvc_suffix}",
+            command_summary=f"{role} on {ns_display}{pvc_suffix}: {reason}",
         )
 
     def grant(
@@ -122,22 +198,27 @@ class K8sTokenModule(BaseGateModule):
         label_domain = str(config.get("k8s_label_domain", "oob.gate")).rstrip("/")
         role = str(params["role"])
         namespaces: List[str] = list(params["namespaces"])
+        _, allow_pvcs, _ = _normalize_allow_pvcs(params.get("allow_pvcs"))
         short_id = req_id.replace("-", "")[:12]
-        sa_name = f"{sa_prefix}{short_id}"
+        sa_name = build_jit_sa_name(sa_prefix, short_id, allow_pvcs)
         exp_ts = int(time.time()) + ttl_seconds
         exp_iso = datetime.datetime.fromtimestamp(exp_ts, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        annotations = {
+            f"{label_domain}/expires-at": str(exp_ts),
+            f"{label_domain}/expires-iso": exp_iso,
+            f"{label_domain}/reason": sanitize_text(params.get("reason", ""), max_len=200),
+            f"{label_domain}/namespaces": ",".join(namespaces),
+        }
+        if allow_pvcs:
+            annotations[f"{label_domain}/allowed-pvcs"] = ",".join(allow_pvcs)
 
         meta_common = {
             "labels": {
                 f"{label_domain}/managed": "true",
                 f"{label_domain}/request-id": short_id,
             },
-            "annotations": {
-                f"{label_domain}/expires-at": str(exp_ts),
-                f"{label_domain}/expires-iso": exp_iso,
-                f"{label_domain}/reason": sanitize_text(params.get("reason", ""), max_len=200),
-                f"{label_domain}/namespaces": ",".join(namespaces),
-            },
+            "annotations": annotations,
         }
 
         rollback_metadata = {
@@ -220,6 +301,7 @@ class K8sTokenModule(BaseGateModule):
             "broker_namespace": broker_ns,
             "role": role,
             "namespaces": namespaces,
+            "allowed_pvcs": allow_pvcs,
             "expires_at": exp_iso,
             "ttl_seconds": ttl_seconds,
         }

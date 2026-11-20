@@ -5,7 +5,7 @@
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(stdlib%20only)-success.svg)](ha_oob_gate)
 [![MCP Compatible](https://img.shields.io/badge/MCP-JSON--RPC%202.0%20stdio-purple.svg)](ha_oob_gate/mcp_server.py)
 
-**`ha-oob-gate`** is a zero-dependency Out-of-Band (OOB) authorization gateway (`v5.2.0`, Python 3.10+) that turns **Home Assistant Companion App actionable push notifications** into a cryptographic human-in-the-loop approval boundary for **AI coding agents** (Claude Code, Cursor, Windsurf, Cline, Roo Code, OpenCode, Codex) and **Linux/Kubernetes infrastructure**.
+**`ha-oob-gate`** is a zero-dependency Out-of-Band (OOB) authorization gateway (`v5.3.0`, Python 3.10+) that turns **Home Assistant Companion App actionable push notifications** into a cryptographic human-in-the-loop approval boundary for **AI coding agents** (Claude Code, Cursor, Windsurf, Cline, Roo Code, OpenCode, Codex) and **Linux/Kubernetes infrastructure**.
 
 Instead of granting autonomous agents standing `NOPASSWD: ALL` sudo privileges, cluster-admin kubeconfigs, broad GitHub Personal Access Tokens, or raw Home Assistant long-lived tokens, `ha-oob-gate` enforces **Just-Enough-Administration (JEA)** and **Just-In-Time (JIT)** leases with a single tap on your phone or smartwatch.
 
@@ -60,7 +60,7 @@ Instead of granting autonomous agents standing `NOPASSWD: ALL` sudo privileges, 
 | `sudo_batch` | `oob-auth sudo-batch` | `oob_sudo_batch` | Human-approved `root` execution of a SHA-256-pinned bash snapshot with mount-namespace & `systemd-run` self-tamper guardrails |
 | `pam_sudo` | *(invoked by `/etc/pam.d/sudo`)* | — | Single-use HMAC-signed command-pinned tickets (`timestamp_timeout=0`) with `/proc/<pid>/cmdline` verification & allowlist enforcement |
 | `ssh_gate` | `oob-auth --ssh-enforce` | — | OpenSSH `ForceCommand` wrapper with canonical binary allowlists, `RuntimeMaxSec`, and `/proc`-verified group/session termination |
-| `k8s_token` | `oob-auth k8s-token` | `oob_k8s_token` | Mints 30-minute namespace-scoped Kubernetes `TokenRequest` JWTs (`view`, `jit-workload-operator`, `jit-storage-operator`) |
+| `k8s_token` | `oob-auth k8s-token` | `oob_k8s_token` | Mints 30-minute namespace-scoped Kubernetes `TokenRequest` JWTs (`view`, `jit-workload-operator`, `jit-storage-operator`) with optional exact PVC claim pinning (`--allow-pvc`) |
 | `github_token` | `oob-auth github-token` | `oob_github_token` | Mints 1-hour single-repo GitHub App installation tokens evaluated via live repository topics (`oob-read`/`oob-write`/`oob-oob`/`oob-deny`; `--workflows` always requires OOB phone approval) |
 | `github_repo_create` | `oob-auth github-create-repo` | `oob_github_create_repo` | Creates new GitHub repositories gated by mobile approval, automatically applying `oob-<tier>` policy topics with zero admin token leak |
 | `self_update` | `oob-auth self-update` | `oob_self_update` | CI-verified self-updater pulling strictly from GitHub `main` on dedicated `OOB GATE UPDATE` channel with 8s auto-rollback watchdog |
