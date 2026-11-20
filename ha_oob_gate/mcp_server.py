@@ -53,6 +53,12 @@ MCP_TOOLS: List[Dict[str, Any]] = [
                     "default": ["default"],
                     "description": "Target Kubernetes namespaces (e.g. ['default'])",
                 },
+                "allow_pvcs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "default": [],
+                    "description": "Optional exact PVC claimName(s) to authorize for CEL-guarded Pod/Deployment mounts",
+                },
                 "reason": {"type": "string", "description": "Reason for Kubernetes elevation"},
             },
             "required": ["namespaces", "reason"],
@@ -287,6 +293,7 @@ def dispatch_mcp_tool_call(
             {
                 "role": arguments.get("role", "jit-workload-operator"),
                 "namespaces": arguments.get("namespaces", ["default"]),
+                "allow_pvcs": arguments.get("allow_pvcs", []),
                 "reason": arguments.get("reason", ""),
             },
         ),

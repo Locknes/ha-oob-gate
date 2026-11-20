@@ -162,11 +162,19 @@ spec:
           variables.podSpec.?volumes.orValue([]).all(v,
             (!has(v.hostPath) || v.hostPath.path in variables.allowedHostPaths) &&
             !has(v.secret) &&
-            !has(v.persistentVolumeClaim) &&
+            (
+              !has(v.persistentVolumeClaim) ||
+              (
+                request.userInfo.username.startsWith(variables.jitPrefix) &&
+                v.persistentVolumeClaim.?claimName.orValue("") != "" &&
+                !v.persistentVolumeClaim.claimName.contains("--") &&
+                request.userInfo.username.contains("--pvc--" + v.persistentVolumeClaim.claimName + "--")
+              )
+            ) &&
             (!has(v.projected) || v.projected.?sources.orValue([]).all(s, !has(s.serviceAccountToken) && !has(s.secret)))
           )
         )
-      message: "JIT Guardrail: Workloads may not use privileged: true, hostPID/hostIPC/hostNetwork: true, hostPort, hostAliases, added Linux capabilities, Unconfined seccomp/AppArmor/procMount/seLinuxOptions, ephemeralContainers, non-default ServiceAccounts, Secret/PVC mounts, or unapproved hostPath volumes."
+      message: "JIT Guardrail: Workloads may not use privileged: true, hostPID/hostIPC/hostNetwork: true, hostPort, hostAliases, added Linux capabilities, Unconfined seccomp/AppArmor/procMount/seLinuxOptions, ephemeralContainers, non-default ServiceAccounts, Secret mounts, unapproved PVC mounts (request exact claim via --allow-pvc), or unapproved hostPath volumes."
 
     # 5. Block cluster-scoped PersistentVolume creation/modification unless explicitly enabled in jit-guardrails-config (never allow hostPath/local PVs)
     - expression: >-

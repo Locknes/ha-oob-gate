@@ -48,6 +48,16 @@ oob-auth revoke
 
 Allowed roles: `view`, `jit-workload-operator`, `jit-storage-operator`.
 
+To authorize mounting specific PersistentVolumeClaim(s) in a Pod/Deployment under `jit-security-guardrails` CEL validation, pass `--allow-pvc <claimName>` (repeatable; displayed explicitly on the mobile approval push and encoded into the ephemeral ServiceAccount name):
+
+```bash
+eval "$(oob-auth k8s-token \
+  --role jit-workload-operator \
+  --namespaces media-servers \
+  --allow-pvc pvc-app-data \
+  --reason "Deploy app with its Longhorn PVC")"
+```
+
 ---
 
 ## 3. GitHub Repository Token & OOB Repository Creation (`github-token`, `github-create-repo`)
