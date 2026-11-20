@@ -5,7 +5,7 @@
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(stdlib%20only)-success.svg)](ha_oob_gate)
 [![MCP Compatible](https://img.shields.io/badge/MCP-JSON--RPC%202.0%20stdio-purple.svg)](ha_oob_gate/mcp_server.py)
 
-**`ha-oob-gate`** is a zero-dependency Out-of-Band (OOB) authorization gateway (`v5.3.0`, Python 3.10+) that turns **Home Assistant Companion App actionable push notifications** into a cryptographic human-in-the-loop approval boundary for **AI coding agents** (Claude Code, Cursor, Windsurf, Cline, Roo Code, OpenCode, Codex) and **Linux/Kubernetes infrastructure**.
+**`ha-oob-gate`** is a zero-dependency Out-of-Band (OOB) authorization gateway (`v5.4.0`, Python 3.10+) that turns **Home Assistant Companion App actionable push notifications** into a cryptographic human-in-the-loop approval boundary for **AI coding agents** (Claude Code, Cursor, Windsurf, Cline, Roo Code, OpenCode, Codex) and **Linux/Kubernetes infrastructure**.
 
 Instead of granting autonomous agents standing `NOPASSWD: ALL` sudo privileges, cluster-admin kubeconfigs, broad GitHub Personal Access Tokens, or raw Home Assistant long-lived tokens, `ha-oob-gate` enforces **Just-Enough-Administration (JEA)** and **Just-In-Time (JIT)** leases with a single tap on your phone or smartwatch.
 

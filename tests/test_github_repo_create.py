@@ -456,9 +456,17 @@ class TestGitHubRepoCreateModule(unittest.TestCase):
 
         self.assertEqual(resolved["status"], "approved")
         self.assertTrue(resolved["workflows"])
+        self.assertTrue(resolved["ci_read"])
         self.assertEqual(
             mint_calls[-1]["permissions"],
-            {"metadata": "read", "contents": "write", "pull_requests": "write", "workflows": "write"},
+            {
+                "metadata": "read",
+                "contents": "write",
+                "pull_requests": "write",
+                "workflows": "write",
+                "actions": "read",
+                "checks": "read",
+            },
         )
 
 

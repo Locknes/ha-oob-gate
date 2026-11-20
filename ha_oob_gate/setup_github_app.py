@@ -60,6 +60,8 @@ def build_app_manifest(
     else:
         effective_name = app_name
         perms = {
+            "actions": "read",
+            "checks": "read",
             "contents": "write",
             "pull_requests": "write",
             "workflows": "write",
@@ -95,7 +97,8 @@ def render_manifest_html(
     else:
         perm_desc = (
             "least-privilege permissions (<code>contents: write</code>, "
-            "<code>pull_requests: write</code>, <code>workflows: write</code> "
+            "<code>pull_requests: write</code>, <code>actions: read</code>, "
+            "<code>checks: read</code>, <code>workflows: write</code> "
             "minted only on explicit OOB <code>--workflows</code> approval, "
             "<code>metadata: read</code>) and no webhooks."
         )
