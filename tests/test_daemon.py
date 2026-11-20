@@ -812,9 +812,110 @@ class TestDaemonEngineAndIPC(unittest.TestCase):
 
         self.assertEqual(resolved["status"], "approved")
         self.assertTrue(resolved["workflows"])
+        self.assertTrue(resolved["ci_read"])
         self.assertEqual(
             mint_payloads[-1]["permissions"],
-            {"metadata": "read", "contents": "write", "pull_requests": "write", "workflows": "write"},
+            {
+                "metadata": "read",
+                "contents": "write",
+                "pull_requests": "write",
+                "workflows": "write",
+                "actions": "read",
+                "checks": "read",
+            },
+        )
+
+    def test_github_token_ci_read_scopes_and_422_fallback(self) -> None:
+        caller = CallerInfo(uid=1001, gid=1001, pid=4045, username="dev-agent", is_root=False)
+        fake_pem_path = os.path.join(self.tmp_dir.name, "fake_gh_ci.pem")
+        with open(fake_pem_path, "w", encoding="utf-8") as f:
+            f.write("-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n")
+
+        gh_cfg = dict(self.config)
+        gh_cfg["module_config"] = {
+            "github_token": {
+                "app_id": "12345",
+                "installation_id": "999",
+                "private_key_path": fake_pem_path,
+                "allow_vault_pat_fallback": False,
+                "default_repo_policy": "deny",
+            }
+        }
+        gh_engine = GateEngine(gh_cfg)
+
+        # 1. Read token mints `actions: read`, `checks: read`, and `pull_requests: read` when enabled
+        read_payloads = []
+
+        def fake_gh_full(url, token, method="GET", payload=None):
+            if url.endswith("/access_tokens") and method == "POST":
+                read_payloads.append(payload)
+                return 201, {"token": "ghs_ci_read_tok", "expires_at": "2026-11-20T18:00:00Z"}
+            if url.endswith("/topics"):
+                return 200, {"names": ["oob-write"]}
+            if url.endswith("/properties/values"):
+                return 200, []
+            return 204, {}
+
+        with patch("ha_oob_gate.modules.github_token.create_github_app_jwt", return_value="fake.jwt.sig"):
+            with patch("ha_oob_gate.modules.github_token._github_api_request", side_effect=fake_gh_full):
+                res = gh_engine.submit_and_wait(
+                    "github_token",
+                    {"repo": "locklabs/bunkr-browser", "permission": "read", "reason": "check CI"},
+                    caller,
+                    wait_seconds=0,
+                )
+        self.assertEqual(res["status"], "approved")
+        self.assertTrue(res["ci_read"])
+        self.assertEqual(
+            read_payloads[-1]["permissions"],
+            {
+                "metadata": "read",
+                "contents": "read",
+                "pull_requests": "read",
+                "actions": "read",
+                "checks": "read",
+            },
+        )
+
+        # 2. If GitHub returns HTTP 422 because `actions`/`checks` aren't enabled yet on the App,
+        # read falls back to `pull_requests: read` (then core), and write falls back cleanly to core scopes.
+        fallback_payloads = []
+
+        def fake_gh_legacy_app(url, token, method="GET", payload=None):
+            if url.endswith("/access_tokens") and method == "POST":
+                perms = (payload or {}).get("permissions", {})
+                fallback_payloads.append(perms)
+                if "actions" in perms or "checks" in perms:
+                    return 422, {"message": "The permissions requested are not granted to this installation."}
+                return 201, {"token": "ghs_fallback_tok", "expires_at": "2026-11-20T18:00:00Z"}
+            if url.endswith("/topics"):
+                return 200, {"names": ["oob-write"]}
+            if url.endswith("/properties/values"):
+                return 200, []
+            return 204, {}
+
+        with patch("ha_oob_gate.modules.github_token.create_github_app_jwt", return_value="fake.jwt.sig"):
+            with patch("ha_oob_gate.modules.github_token._github_api_request", side_effect=fake_gh_legacy_app):
+                res_r = gh_engine.submit_and_wait(
+                    "github_token",
+                    {"repo": "locklabs/bunkr-browser", "permission": "read", "reason": "legacy read"},
+                    caller,
+                    wait_seconds=0,
+                )
+                res_w = gh_engine.submit_and_wait(
+                    "github_token",
+                    {"repo": "locklabs/bunkr-browser", "permission": "write", "reason": "legacy write"},
+                    caller,
+                    wait_seconds=0,
+                )
+        self.assertEqual(res_r["status"], "approved")
+        self.assertFalse(res_r["ci_read"])
+        self.assertEqual(res_w["status"], "approved")
+        self.assertFalse(res_w["ci_read"])
+        self.assertIn({"metadata": "read", "contents": "read", "pull_requests": "read"}, fallback_payloads)
+        self.assertEqual(
+            fallback_payloads[-1],
+            {"metadata": "read", "contents": "write", "pull_requests": "write"},
         )
 
 

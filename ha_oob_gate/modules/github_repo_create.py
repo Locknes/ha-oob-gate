@@ -47,7 +47,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from .. import __version__
 from ..sanitize import sanitize_text
 from . import BaseGateModule, CallerInfo, NotificationSpec
-from .github_token import VALID_REPO_RE, _github_api_request, create_github_app_jwt
+from .github_token import (
+    VALID_REPO_RE,
+    _github_api_request,
+    create_github_app_jwt,
+    mint_single_repo_installation_token,
+)
 
 TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,49}$")
 RESERVED_TOPIC_PREFIXES = ("oob-", "agy-")
@@ -622,21 +627,14 @@ class GitHubRepoCreateModule(BaseGateModule):
             mint_key_path = cfg["token_private_key_path"] if cfg["token_app_id"] else cfg["private_key_path"]
             app_jwt = create_github_app_jwt(mint_app_id, private_key_path=mint_key_path)
             _, created_name = canonical_full.split("/", 1)
-            mint_perms = {
-                "metadata": "read",
-                "contents": "write",
-                "pull_requests": "write",
-            }
-            if params.get("workflows"):
-                mint_perms["workflows"] = "write"
-            code_m, mint_data = _github_api_request(
-                f"{api_url}/app/installations/{token_inst_id}/access_tokens",
+            code_m, mint_data, ci_read_granted = mint_single_repo_installation_token(
+                api_url,
+                token_inst_id,
+                created_name,
                 app_jwt,
-                method="POST",
-                payload={
-                    "repositories": [created_name],
-                    "permissions": mint_perms,
-                },
+                permission="write",
+                workflows=bool(params.get("workflows", False)),
+                api_request_fn=_github_api_request,
             )
             if code_m != 201 or not mint_data.get("token"):
                 raise RuntimeError(
@@ -645,6 +643,7 @@ class GitHubRepoCreateModule(BaseGateModule):
                 )
             result["mode"] = "github_app"
             result["workflows"] = bool(params.get("workflows", False))
+            result["ci_read"] = ci_read_granted
             result["token"] = mint_data["token"]
             result["expires_at"] = mint_data.get("expires_at", "")
 

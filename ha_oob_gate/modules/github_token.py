@@ -194,6 +194,72 @@ def _github_api_request(
         return e.code, err_json
 
 
+def mint_single_repo_installation_token(
+    api_url: str,
+    inst_id: str,
+    repo_name: str,
+    app_jwt: str,
+    *,
+    permission: str = "read",
+    workflows: bool = False,
+    api_request_fn: Any = None,
+) -> Tuple[int, Dict[str, Any], bool]:
+    """
+    Mint a single-repository GitHub App installation token with read-only CI/PR inspection
+    scopes (`actions: read`, `checks: read`, plus `pull_requests: read` on read tokens) so
+    agents can verify GitHub Actions check-runs before merging PRs on low-security repos.
+
+    If the GitHub App installation has not yet enabled `actions: read` / `checks: read`
+    (HTTP 422), automatically falls back to the core permission set without breaking token mints.
+    """
+    req_fn = api_request_fn or _github_api_request
+    core_perms: Dict[str, str] = {"metadata": "read", "contents": "read"}
+    if permission == "write":
+        core_perms["contents"] = "write"
+        core_perms["pull_requests"] = "write"
+        if workflows:
+            core_perms["workflows"] = "write"
+
+    enhanced_perms = dict(core_perms)
+    enhanced_perms["actions"] = "read"
+    enhanced_perms["checks"] = "read"
+    if permission != "write":
+        enhanced_perms["pull_requests"] = "read"
+
+    url = f"{api_url}/app/installations/{inst_id}/access_tokens"
+    code, tok_data = req_fn(
+        url,
+        app_jwt,
+        method="POST",
+        payload={"repositories": [repo_name], "permissions": enhanced_perms},
+    )
+    if code == 201 and tok_data.get("token"):
+        return code, tok_data, True
+
+    if code == 422:
+        if permission != "write":
+            pr_read_perms = {"metadata": "read", "contents": "read", "pull_requests": "read"}
+            pr_code, pr_data = req_fn(
+                url,
+                app_jwt,
+                method="POST",
+                payload={"repositories": [repo_name], "permissions": pr_read_perms},
+            )
+            if pr_code == 201 and pr_data.get("token"):
+                return pr_code, pr_data, False
+            if pr_code != 422:
+                return pr_code, pr_data, False
+        fb_code, fb_data = req_fn(
+            url,
+            app_jwt,
+            method="POST",
+            payload={"repositories": [repo_name], "permissions": core_perms},
+        )
+        return fb_code, fb_data, False
+
+    return code, tok_data, False
+
+
 class GitHubTokenGateModule(BaseGateModule):
     name = "github_token"
     description = "Hybrid GitHub App tag-based single-repo token broker & root vault PAT gate"
@@ -396,21 +462,14 @@ class GitHubTokenGateModule(BaseGateModule):
             _, repo_name = repo_full.split("/", 1)
             inst_id = params["_gh_inst_id"]
 
-            gh_perms = {"metadata": "read", "contents": "read"}
-            if perm == "write":
-                gh_perms["contents"] = "write"
-                gh_perms["pull_requests"] = "write"
-                if workflows:
-                    gh_perms["workflows"] = "write"
-
-            code, tok_data = _github_api_request(
-                f"{gh_cfg['api_url']}/app/installations/{inst_id}/access_tokens",
+            code, tok_data, ci_read_granted = mint_single_repo_installation_token(
+                gh_cfg["api_url"],
+                inst_id,
+                repo_name,
                 app_jwt,
-                method="POST",
-                payload={
-                    "repositories": [repo_name],
-                    "permissions": gh_perms,
-                },
+                permission=perm,
+                workflows=workflows,
+                api_request_fn=_github_api_request,
             )
             if code != 201 or not tok_data.get("token"):
                 hint = (
@@ -425,6 +484,7 @@ class GitHubTokenGateModule(BaseGateModule):
                 "repo": repo_full,
                 "permission": perm,
                 "workflows": workflows,
+                "ci_read": ci_read_granted,
                 "token": tok_data["token"],
                 "expires_at": tok_data.get("expires_at", ""),
                 "policy_reason": params.get("_gh_policy_reason", ""),

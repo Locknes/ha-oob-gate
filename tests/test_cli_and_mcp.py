@@ -104,7 +104,7 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
         init_resp = handle_mcp_jsonrpc_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, self.config)
         self.assertEqual(init_resp["result"]["serverInfo"]["name"], "ha-oob-gate")
         self.assertEqual(init_resp["result"]["serverInfo"]["version"], __version__)
-        self.assertEqual(__version__, "5.3.0")
+        self.assertEqual(__version__, "5.4.0")
 
         list_resp = handle_mcp_jsonrpc_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, self.config)
         tool_names = {t["name"] for t in list_resp["result"]["tools"]}
@@ -320,9 +320,15 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
         import ha_oob_gate.cli as cli_mod
         from ha_oob_gate.setup_github_app import build_app_manifest
 
-        # 1. Manifest grants workflows: write to token-broker, never to repo-creator
-        self.assertEqual(build_app_manifest(role="token-broker")["default_permissions"].get("workflows"), "write")
-        self.assertNotIn("workflows", build_app_manifest(role="repo-creator")["default_permissions"])
+        # 1. Manifest grants workflows: write + actions/checks: read to token-broker, never to repo-creator
+        broker_perms = build_app_manifest(role="token-broker")["default_permissions"]
+        creator_perms = build_app_manifest(role="repo-creator")["default_permissions"]
+        self.assertEqual(broker_perms.get("workflows"), "write")
+        self.assertEqual(broker_perms.get("actions"), "read")
+        self.assertEqual(broker_perms.get("checks"), "read")
+        self.assertNotIn("workflows", creator_perms)
+        self.assertNotIn("actions", creator_perms)
+        self.assertNotIn("checks", creator_perms)
 
         # 2. CLI `--workflows` passes `workflows=True` in params and prints clean stdout
         seen_payloads = []
