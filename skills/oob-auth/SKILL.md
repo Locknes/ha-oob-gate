@@ -60,7 +60,7 @@ eval "$(oob-auth k8s-token \
 
 ---
 
-## 3. GitHub Repository Token & OOB Repository Creation (`github-token`, `github-create-repo`)
+## 3. GitHub Repository Token, Repo Creation & Tier Policy (`github-token`, `github-create-repo`, `github-set-tier`)
 
 Request a 1-hour single-repository token evaluated against live repository topics (`oob-read` / `oob-write` / `oob-oob` / `oob-deny`):
 
@@ -80,6 +80,15 @@ TOKEN="$(oob-auth github-create-repo \
   --description "Clean Home Assistant blueprints" \
   --mint-token \
   --reason "Bootstrap new public blueprint repository")"
+```
+
+Promote or tighten a repository's OOB access tier (`oob-oob`, `oob-read`, `oob-write`, `oob-deny`) under explicit mobile approval (preserves non-policy topics; rejects Tier-0 protected repos such as `ha-oob-gate` from promotion to `oob-write`):
+
+```bash
+oob-auth github-set-tier \
+  --repo owner/repo \
+  --oob-tier write \
+  --reason "Promote central workload GitOps repo to oob-write after bootstrap"
 ```
 
 ---

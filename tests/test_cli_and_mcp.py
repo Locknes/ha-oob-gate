@@ -104,7 +104,7 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
         init_resp = handle_mcp_jsonrpc_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, self.config)
         self.assertEqual(init_resp["result"]["serverInfo"]["name"], "ha-oob-gate")
         self.assertEqual(init_resp["result"]["serverInfo"]["version"], __version__)
-        self.assertEqual(__version__, "5.4.0")
+        self.assertEqual(__version__, "5.5.0")
 
         list_resp = handle_mcp_jsonrpc_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, self.config)
         tool_names = {t["name"] for t in list_resp["result"]["tools"]}
@@ -115,6 +115,7 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
                 "oob_k8s_token",
                 "oob_github_token",
                 "oob_github_create_repo",
+                "oob_github_set_tier",
                 "oob_ha_api",
                 "oob_ha_api_call",
                 "oob_secret_checkout",
@@ -476,6 +477,68 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
         )
         self.assertFalse(mcp_resp["result"]["isError"])
         self.assertEqual(seen_mcp[-1]["params"]["allow_pvcs"], ["pvc-bunkr-browser-data"])
+
+    def test_github_set_tier_cli_and_mcp_forwarding(self) -> None:
+        import ha_oob_gate.cli as cli_mod
+
+        seen_cli = []
+
+        def fake_sock(sock_path, payload, timeout):
+            seen_cli.append(payload)
+            return {
+                "status": "approved",
+                "repo": "locklabs/k8s-apps-gitops",
+                "oob_tier": "write",
+                "topic": "oob-write",
+                "previous_oob_topics": ["oob-oob"],
+                "topics": ["oob-write", "fleet"],
+            }
+
+        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.runtime_dir}, clear=False):
+            with patch("ha_oob_gate.cli.load_config", return_value=self.config):
+                out_gh, err_gh = io.StringIO(), io.StringIO()
+                with patch("ha_oob_gate.cli.send_unix_socket_request", side_effect=fake_sock):
+                    with redirect_stdout(out_gh), redirect_stderr(err_gh):
+                        with self.assertRaises(SystemExit) as cm:
+                            cli_mod.main([
+                                "github-set-tier",
+                                "--repo",
+                                "locklabs/k8s-apps-gitops",
+                                "--oob-tier",
+                                "write",
+                                "--reason",
+                                "Promote central workload Fleet repo",
+                            ])
+                        self.assertEqual(cm.exception.code, 0)
+        self.assertEqual(out_gh.getvalue(), "oob-write\n")
+        self.assertEqual(seen_cli[-1]["module"], "github_repo_tier")
+        self.assertEqual(seen_cli[-1]["params"]["oob_tier"], "write")
+        self.assertIn("oob-oob -> oob-write", err_gh.getvalue())
+
+        seen_mcp = []
+        mcp_resp = handle_mcp_jsonrpc_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": "oob_github_set_tier",
+                    "arguments": {
+                        "repo": "locklabs/k8s-apps-gitops",
+                        "oob_tier": "write",
+                        "reason": "Promote repo via MCP",
+                    },
+                },
+            },
+            self.config,
+            socket_requester=lambda s, p, t: (
+                seen_mcp.append(p)
+                or {"status": "approved", "repo": "locklabs/k8s-apps-gitops", "topic": "oob-write"}
+            ),
+        )
+        self.assertFalse(mcp_resp["result"]["isError"])
+        self.assertEqual(seen_mcp[-1]["module"], "github_repo_tier")
+        self.assertEqual(seen_mcp[-1]["params"]["oob_tier"], "write")
 
 
 if __name__ == "__main__":

@@ -116,6 +116,23 @@ MCP_TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "oob_github_set_tier",
+        "description": (
+            "Promote or tighten an existing GitHub repository's `oob-<tier>` topic (`oob`, `read`, `write`, `deny`) "
+            "gated strictly by Home Assistant mobile approval, while preserving non-policy topics and blocking "
+            "Tier-0 protected repos from promotion to `oob-write`."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Target repository in 'owner/repo' format"},
+                "oob_tier": {"type": "string", "enum": ["oob", "read", "write", "deny"]},
+                "reason": {"type": "string", "description": "Reason for changing this repository's OOB tier"},
+            },
+            "required": ["repo", "oob_tier", "reason"],
+        },
+    },
+    {
         "name": "oob_ha_api",
         "description": (
             "Request a filtered Home Assistant REST API proxy call (`mode='single'`) or 15-minute proxy lease "
@@ -306,6 +323,14 @@ def dispatch_mcp_tool_call(
                 "reason": arguments.get("reason", ""),
             },
         ),
+        "oob_github_set_tier": (
+            "github_repo_tier",
+            {
+                "repo": arguments.get("repo", ""),
+                "oob_tier": arguments.get("oob_tier", ""),
+                "reason": arguments.get("reason", ""),
+            },
+        ),
         "oob_github_create_repo": (
             "github_repo_create",
             {
@@ -316,6 +341,14 @@ def dispatch_mcp_tool_call(
                 "topics": arguments.get("topics", []),
                 "mint_token": bool(arguments.get("mint_token", False)),
                 "workflows": bool(arguments.get("workflows", False)),
+                "reason": arguments.get("reason", ""),
+            },
+        ),
+        "oob_github_set_tier": (
+            "github_repo_tier",
+            {
+                "repo": arguments.get("repo", ""),
+                "oob_tier": arguments.get("oob_tier", ""),
                 "reason": arguments.get("reason", ""),
             },
         ),

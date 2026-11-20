@@ -22,6 +22,8 @@
     "ssh_gate",
     "k8s_token",
     "github_token",
+    "github_repo_create",
+    "github_repo_tier",
     "ha_api",
     "generic_confirm",
     "secret_checkout",

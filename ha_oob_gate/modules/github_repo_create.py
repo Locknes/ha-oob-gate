@@ -186,6 +186,82 @@ def _load_root_user_token(cfg: Dict[str, Any]) -> Tuple[Optional[str], str]:
     return None, ""
 
 
+def resolve_repo_admin_config(
+    config: Dict[str, Any],
+    *,
+    section: str = "github_repo_create",
+    fallback_section: str = "",
+) -> Dict[str, Any]:
+    """Resolve shared GitHub App + root user credential config for repository administration modules."""
+    mod_root = config.get("module_config", {})
+    gh_tok_cfg = mod_root.get("github_token", {})
+    fb_cfg = mod_root.get(fallback_section, {}) if fallback_section else {}
+    sec_cfg = mod_root.get(section, {})
+    merged_cfg = {**fb_cfg, **sec_cfg}
+
+    raw_owners = merged_cfg.get("allowed_owners") or []
+    allowed_owners = [str(o).strip().lower() for o in raw_owners if str(o).strip()]
+
+    token_app_id = str(gh_tok_cfg.get("app_id") or os.environ.get("GITHUB_APP_ID", "")).strip()
+    token_key_path = str(gh_tok_cfg.get("private_key_path") or "/etc/ha-sudo/secrets/github_app.pem")
+
+    has_dedicated_creator_app = bool(str(merged_cfg.get("app_id") or "").strip())
+    creator_app_id = str(merged_cfg.get("app_id") or token_app_id).strip()
+    creator_key_path = str(
+        merged_cfg.get("private_key_path")
+        or (DEFAULT_REPO_CREATOR_PEM_PATH if has_dedicated_creator_app else token_key_path)
+    )
+    return {
+        "api_url": str(merged_cfg.get("api_url") or gh_tok_cfg.get("api_url") or "https://api.github.com").rstrip("/"),
+        "oauth_token_url": str(merged_cfg.get("oauth_token_url") or DEFAULT_OAUTH_TOKEN_URL),
+        "app_id": creator_app_id,
+        "private_key_path": creator_key_path,
+        "token_app_id": token_app_id,
+        "token_private_key_path": token_key_path,
+        "repo_admin_pat_path": str(merged_cfg.get("repo_admin_pat_path") or DEFAULT_REPO_ADMIN_PAT_PATH),
+        "user_oauth_path": str(merged_cfg.get("user_oauth_path") or DEFAULT_USER_OAUTH_PATH),
+        "vault_pat_path": str(
+            merged_cfg.get("vault_pat_path")
+            or gh_tok_cfg.get("vault_pat_path")
+            or "/etc/ha-sudo/secrets/github_push_pat"
+        ),
+        "allow_vault_pat_fallback": bool(
+            merged_cfg.get("allow_vault_pat_fallback", gh_tok_cfg.get("allow_vault_pat_fallback", True))
+        ),
+        "allow_write_tier_on_create": bool(merged_cfg.get("allow_write_tier_on_create", False)),
+        "allowed_owners": allowed_owners,
+    }
+
+
+def discover_app_installations(
+    api_url: str,
+    app_id: str,
+    key_path: str,
+) -> Dict[str, Dict[str, Any]]:
+    """Query `/app/installations` and return a lowercased-login map of GitHub App installation metadata."""
+    if not app_id or not os.path.isfile(key_path):
+        return {}
+    app_jwt = create_github_app_jwt(app_id, private_key_path=key_path)
+    code, inst_list = _github_api_request(f"{api_url}/app/installations", app_jwt, method="GET")
+    if code != 200 or not isinstance(inst_list, list):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for item in inst_list:
+        if not isinstance(item, dict):
+            continue
+        acct = item.get("account") or {}
+        login = str(acct.get("login") or "").strip()
+        inst_id = item.get("id")
+        if login and inst_id:
+            out[login.lower()] = {
+                "id": str(inst_id),
+                "login": login,
+                "type": str(acct.get("type") or "User"),
+                "repository_selection": str(item.get("repository_selection") or "all"),
+            }
+    return out
+
+
 class GitHubRepoCreateModule(BaseGateModule):
     name = "github_repo_create"
     description = "OOB-gated GitHub repository creation with automatic policy tagging & zero admin token leak"
@@ -199,41 +275,7 @@ class GitHubRepoCreateModule(BaseGateModule):
         return bool(params.get("_gh_api_called"))
 
     def _get_create_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        mod_root = config.get("module_config", {})
-        gh_tok_cfg = mod_root.get("github_token", {})
-        create_cfg = mod_root.get("github_repo_create", {})
-        raw_owners = create_cfg.get("allowed_owners") or []
-        allowed_owners = [str(o).strip().lower() for o in raw_owners if str(o).strip()]
-
-        token_app_id = str(gh_tok_cfg.get("app_id") or os.environ.get("GITHUB_APP_ID", "")).strip()
-        token_key_path = str(gh_tok_cfg.get("private_key_path") or "/etc/ha-sudo/secrets/github_app.pem")
-
-        has_dedicated_creator_app = bool(str(create_cfg.get("app_id") or "").strip())
-        creator_app_id = str(create_cfg.get("app_id") or token_app_id).strip()
-        creator_key_path = str(
-            create_cfg.get("private_key_path")
-            or (DEFAULT_REPO_CREATOR_PEM_PATH if has_dedicated_creator_app else token_key_path)
-        )
-        return {
-            "api_url": str(create_cfg.get("api_url") or gh_tok_cfg.get("api_url") or "https://api.github.com").rstrip("/"),
-            "oauth_token_url": str(create_cfg.get("oauth_token_url") or DEFAULT_OAUTH_TOKEN_URL),
-            "app_id": creator_app_id,
-            "private_key_path": creator_key_path,
-            "token_app_id": token_app_id,
-            "token_private_key_path": token_key_path,
-            "repo_admin_pat_path": str(create_cfg.get("repo_admin_pat_path") or DEFAULT_REPO_ADMIN_PAT_PATH),
-            "user_oauth_path": str(create_cfg.get("user_oauth_path") or DEFAULT_USER_OAUTH_PATH),
-            "vault_pat_path": str(
-                create_cfg.get("vault_pat_path")
-                or gh_tok_cfg.get("vault_pat_path")
-                or "/etc/ha-sudo/secrets/github_push_pat"
-            ),
-            "allow_vault_pat_fallback": bool(
-                create_cfg.get("allow_vault_pat_fallback", gh_tok_cfg.get("allow_vault_pat_fallback", True))
-            ),
-            "allow_write_tier_on_create": bool(create_cfg.get("allow_write_tier_on_create", False)),
-            "allowed_owners": allowed_owners,
-        }
+        return resolve_repo_admin_config(config, section="github_repo_create")
 
     def _discover_app_installations(
         self,
@@ -241,27 +283,7 @@ class GitHubRepoCreateModule(BaseGateModule):
         app_id: str,
         key_path: str,
     ) -> Dict[str, Dict[str, Any]]:
-        if not app_id or not os.path.isfile(key_path):
-            return {}
-        app_jwt = create_github_app_jwt(app_id, private_key_path=key_path)
-        code, inst_list = _github_api_request(f"{api_url}/app/installations", app_jwt, method="GET")
-        if code != 200 or not isinstance(inst_list, list):
-            return {}
-        out: Dict[str, Dict[str, Any]] = {}
-        for item in inst_list:
-            if not isinstance(item, dict):
-                continue
-            acct = item.get("account") or {}
-            login = str(acct.get("login") or "").strip()
-            inst_id = item.get("id")
-            if login and inst_id:
-                out[login.lower()] = {
-                    "id": str(inst_id),
-                    "login": login,
-                    "type": str(acct.get("type") or "User"),
-                    "repository_selection": str(item.get("repository_selection") or "all"),
-                }
-        return out
+        return discover_app_installations(api_url, app_id, key_path)
 
     def validate(self, params: Dict[str, Any], caller: CallerInfo, config: Dict[str, Any]) -> Tuple[bool, str]:
         repo_full = str(params.get("repo") or "").strip()
