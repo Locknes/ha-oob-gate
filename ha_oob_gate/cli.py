@@ -731,6 +731,36 @@ def cmd_github_create_repo(args: argparse.Namespace, config: Dict[str, Any]) -> 
     sys.exit(1)
 
 
+def cmd_github_set_tier(args: argparse.Namespace, config: Dict[str, Any]) -> None:
+    target_topic = f"oob-{args.oob_tier}"
+    sys.stderr.write(
+        f"[oob-auth] 🏷️  Requesting mobile approval to set OOB tier '{target_topic}' on {args.repo}...\n"
+    )
+    sys.stderr.flush()
+    resp = send_unix_socket_request(
+        config["socket_path"],
+        {
+            "action": "module_request",
+            "module": "github_repo_tier",
+            "params": {
+                "repo": args.repo,
+                "oob_tier": args.oob_tier,
+                "reason": args.reason,
+            },
+        },
+        timeout=float(config["timeout_seconds"]) + 15,
+    )
+    if resp.get("status") == "approved" and resp.get("topic"):
+        prev = ", ".join(resp.get("previous_oob_topics") or []) or "(untagged)"
+        sys.stderr.write(f"[oob-auth] ✅ Updated {resp['repo']} tier: {prev} -> {resp['topic']}\n")
+        sys.stdout.write(f"{resp['topic']}\n")
+        sys.exit(0)
+    sys.stderr.write(
+        f"[oob-auth] ❌ GitHub repository tier update {resp.get('status', 'denied')}: {resp.get('message', '')}\n"
+    )
+    sys.exit(1)
+
+
 def _save_ha_lease(req_id: str, caller_nonce: str, resp: Dict[str, Any]) -> None:
     ha_lease_out_path = _runtime_file_path(".jit-ha-lease.json", create_dir=True)
     oflags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
@@ -996,6 +1026,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         "k8s-token",
         "github-token",
         "github-create-repo",
+        "github-set-tier",
         "ha-api",
         "confirm",
         "secret-checkout",
@@ -1084,6 +1115,19 @@ def main(argv: Optional[list[str]] = None) -> None:
         )
         p_ghc.add_argument("--reason", required=True, help="Reason for creating this repository")
 
+        p_ghs = sub.add_parser(
+            "github-set-tier",
+            help="Promote or tighten a GitHub repository's `oob-<tier>` topic under mobile approval",
+        )
+        p_ghs.add_argument("--repo", required=True, help="Target repository in 'owner/repo' format")
+        p_ghs.add_argument(
+            "--oob-tier",
+            required=True,
+            choices=["oob", "read", "write", "deny"],
+            help="Target OOB policy tier (`oob`, `read`, `write`, or `deny`)",
+        )
+        p_ghs.add_argument("--reason", required=True, help="Reason for updating this repository's OOB tier")
+
         p_ha = sub.add_parser("ha-api", help="Execute filtered Home Assistant REST API calls via root proxy (zero raw token exposure)")
         p_ha.add_argument("--lease", action="store_true", help="Request a 15-minute filtered proxy lease")
         p_ha.add_argument("--single", action="store_true", help="Request mobile approval for a single API call without standing lease")
@@ -1120,6 +1164,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             cmd_github_token(args, config)
         elif args.subcmd == "github-create-repo":
             cmd_github_create_repo(args, config)
+        elif args.subcmd == "github-set-tier":
+            cmd_github_set_tier(args, config)
         elif args.subcmd == "ha-api":
             cmd_ha_api(args, config)
         elif args.subcmd == "confirm":

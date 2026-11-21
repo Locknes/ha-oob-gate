@@ -5,7 +5,7 @@
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(stdlib%20only)-success.svg)](ha_oob_gate)
 [![MCP Compatible](https://img.shields.io/badge/MCP-JSON--RPC%202.0%20stdio-purple.svg)](ha_oob_gate/mcp_server.py)
 
-**`ha-oob-gate`** is a zero-dependency Out-of-Band (OOB) authorization gateway (`v5.4.0`, Python 3.10+) that turns **Home Assistant Companion App actionable push notifications** into a cryptographic human-in-the-loop approval boundary for **AI coding agents** (Claude Code, Cursor, Windsurf, Cline, Roo Code, OpenCode, Codex) and **Linux/Kubernetes infrastructure**.
+**`ha-oob-gate`** is a zero-dependency Out-of-Band (OOB) authorization gateway (`v5.5.0`, Python 3.10+) that turns **Home Assistant Companion App actionable push notifications** into a cryptographic human-in-the-loop approval boundary for **AI coding agents** (Claude Code, Cursor, Windsurf, Cline, Roo Code, OpenCode, Codex) and **Linux/Kubernetes infrastructure**.
 
 Instead of granting autonomous agents standing `NOPASSWD: ALL` sudo privileges, cluster-admin kubeconfigs, broad GitHub Personal Access Tokens, or raw Home Assistant long-lived tokens, `ha-oob-gate` enforces **Just-Enough-Administration (JEA)** and **Just-In-Time (JIT)** leases with a single tap on your phone or smartwatch.
 
@@ -63,6 +63,7 @@ Instead of granting autonomous agents standing `NOPASSWD: ALL` sudo privileges, 
 | `k8s_token` | `oob-auth k8s-token` | `oob_k8s_token` | Mints 30-minute namespace-scoped Kubernetes `TokenRequest` JWTs (`view`, `jit-workload-operator`, `jit-storage-operator`) with optional exact PVC claim pinning (`--allow-pvc`) |
 | `github_token` | `oob-auth github-token` | `oob_github_token` | Mints 1-hour single-repo GitHub App installation tokens evaluated via live repository topics (`oob-read`/`oob-write`/`oob-oob`/`oob-deny`; `--workflows` always requires OOB phone approval) |
 | `github_repo_create` | `oob-auth github-create-repo` | `oob_github_create_repo` | Creates new GitHub repositories gated by mobile approval, automatically applying `oob-<tier>` policy topics with zero admin token leak |
+| `github_repo_tier` | `oob-auth github-set-tier` | `oob_github_set_tier` | Promotes or tightens an existing repository's `oob-<tier>` topic under mobile approval while blocking Tier-0 `protected_repos` from `oob-write` |
 | `self_update` | `oob-auth self-update` | `oob_self_update` | CI-verified self-updater pulling strictly from GitHub `main` on dedicated `OOB GATE UPDATE` channel with 8s auto-rollback watchdog |
 | `ha_api` | `oob-auth ha-api` | `oob_ha_api`, `oob_ha_api_call` | Filtered Home Assistant REST API proxy (single-shot or 15m lease) with zero raw token exposure |
 | `secret_checkout` | `oob-auth secret-checkout` | `oob_secret_checkout` | One-time secret checkout from `/etc/ha-sudo/vault.json` or Kubernetes Secrets into `0600` user-private runtime storage |
