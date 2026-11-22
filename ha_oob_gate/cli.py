@@ -1027,6 +1027,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         "github-token",
         "github-create-repo",
         "github-set-tier",
+        "github-repo-tier",
         "ha-api",
         "confirm",
         "secret-checkout",
@@ -1115,18 +1116,21 @@ def main(argv: Optional[list[str]] = None) -> None:
         )
         p_ghc.add_argument("--reason", required=True, help="Reason for creating this repository")
 
-        p_ghs = sub.add_parser(
-            "github-set-tier",
-            help="Promote or tighten a GitHub repository's `oob-<tier>` topic under mobile approval",
-        )
-        p_ghs.add_argument("--repo", required=True, help="Target repository in 'owner/repo' format")
-        p_ghs.add_argument(
-            "--oob-tier",
-            required=True,
-            choices=["oob", "read", "write", "deny"],
-            help="Target OOB policy tier (`oob`, `read`, `write`, or `deny`)",
-        )
-        p_ghs.add_argument("--reason", required=True, help="Reason for updating this repository's OOB tier")
+        for gh_tier_cmd in ("github-set-tier", "github-repo-tier"):
+            p_ghs = sub.add_parser(
+                gh_tier_cmd,
+                help="Promote or tighten a GitHub repository's `oob-<tier>` topic under mobile approval",
+            )
+            p_ghs.add_argument("--repo", required=True, help="Target repository in 'owner/repo' format")
+            p_ghs.add_argument(
+                "--oob-tier",
+                "--tier",
+                dest="oob_tier",
+                required=True,
+                choices=["oob", "read", "write", "deny"],
+                help="Target OOB policy tier (`oob`, `read`, `write`, or `deny`)",
+            )
+            p_ghs.add_argument("--reason", required=True, help="Reason for updating this repository's OOB tier")
 
         p_ha = sub.add_parser("ha-api", help="Execute filtered Home Assistant REST API calls via root proxy (zero raw token exposure)")
         p_ha.add_argument("--lease", action="store_true", help="Request a 15-minute filtered proxy lease")
@@ -1164,7 +1168,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             cmd_github_token(args, config)
         elif args.subcmd == "github-create-repo":
             cmd_github_create_repo(args, config)
-        elif args.subcmd == "github-set-tier":
+        elif args.subcmd in ("github-set-tier", "github-repo-tier"):
             cmd_github_set_tier(args, config)
         elif args.subcmd == "ha-api":
             cmd_ha_api(args, config)

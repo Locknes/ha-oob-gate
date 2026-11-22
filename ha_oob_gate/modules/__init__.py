@@ -157,6 +157,14 @@ def discover_modules(enabled_names: Optional[list[str]] = None) -> Dict[str, Bas
     """
     Dynamically discover and instantiate all BaseGateModule subclasses in this package.
     """
+    effective_enabled: Optional[set[str]] = None
+    if enabled_names is not None:
+        effective_enabled = {str(n).strip() for n in enabled_names if str(n).strip()}
+        # Hosts configured before v5.5 with `enabled_modules: [..., "github_repo_create"]`
+        # should automatically expose companion `github_repo_tier` after self-update.
+        if "github_repo_create" in effective_enabled:
+            effective_enabled.add("github_repo_tier")
+
     registry: Dict[str, BaseGateModule] = {}
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -164,7 +172,7 @@ def discover_modules(enabled_names: Optional[list[str]] = None) -> Dict[str, Bas
         if not fname.endswith(".py") or fname.startswith("_"):
             continue
         mod_basename = fname[:-3]
-        if mod_basename == "example_module" and (not enabled_names or "example_custom" not in enabled_names):
+        if mod_basename == "example_module" and (not effective_enabled or "example_custom" not in effective_enabled):
             continue
         full_mod_name = f"ha_oob_gate.modules.{mod_basename}"
         try:
@@ -175,7 +183,7 @@ def discover_modules(enabled_names: Optional[list[str]] = None) -> Dict[str, Bas
         for _, obj in inspect.getmembers(mod, inspect.isclass):
             if issubclass(obj, BaseGateModule) and obj is not BaseGateModule and getattr(obj, "name", ""):
                 instance: BaseGateModule = obj()
-                if enabled_names is None or instance.name in enabled_names:
+                if effective_enabled is None or instance.name in effective_enabled:
                     registry[instance.name] = instance
 
     return registry

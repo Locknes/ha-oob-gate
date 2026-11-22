@@ -104,7 +104,7 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
         init_resp = handle_mcp_jsonrpc_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, self.config)
         self.assertEqual(init_resp["result"]["serverInfo"]["name"], "ha-oob-gate")
         self.assertEqual(init_resp["result"]["serverInfo"]["version"], __version__)
-        self.assertEqual(__version__, "5.5.0")
+        self.assertEqual(__version__, "5.5.1")
 
         list_resp = handle_mcp_jsonrpc_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, self.config)
         tool_names = {t["name"] for t in list_resp["result"]["tools"]}
@@ -539,6 +539,66 @@ class TestCliMcpAndTokenRotation(unittest.TestCase):
         self.assertFalse(mcp_resp["result"]["isError"])
         self.assertEqual(seen_mcp[-1]["module"], "github_repo_tier")
         self.assertEqual(seen_mcp[-1]["params"]["oob_tier"], "write")
+
+        # Verify `github-repo-tier` + `--tier` CLI alias and `oob_github_repo_tier` MCP alias
+        seen_alias_cli = []
+        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.runtime_dir}, clear=False):
+            with patch("ha_oob_gate.cli.load_config", return_value=self.config):
+                out_al, err_al = io.StringIO(), io.StringIO()
+                with patch(
+                    "ha_oob_gate.cli.send_unix_socket_request",
+                    side_effect=lambda sp, payload, timeout=0: (
+                        seen_alias_cli.append(payload)
+                        or {
+                            "status": "approved",
+                            "repo": "Locknes/lock-rip-site",
+                            "oob_tier": "write",
+                            "topic": "oob-write",
+                            "previous_oob_topics": ["oob-oob"],
+                            "topics": ["oob-write"],
+                        }
+                    ),
+                ):
+                    with redirect_stdout(out_al), redirect_stderr(err_al):
+                        with self.assertRaises(SystemExit) as cm_al:
+                            cli_mod.main([
+                                "github-repo-tier",
+                                "--repo",
+                                "Locknes/lock-rip-site",
+                                "--tier",
+                                "write",
+                                "--reason",
+                                "Alias test",
+                            ])
+                        self.assertEqual(cm_al.exception.code, 0)
+        self.assertEqual(out_al.getvalue(), "oob-write\n")
+        self.assertEqual(seen_alias_cli[-1]["module"], "github_repo_tier")
+        self.assertEqual(seen_alias_cli[-1]["params"]["oob_tier"], "write")
+
+        seen_alias_mcp = []
+        mcp_al_resp = handle_mcp_jsonrpc_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tools/call",
+                "params": {
+                    "name": "oob_github_repo_tier",
+                    "arguments": {
+                        "repo": "Locknes/lock-rip-site",
+                        "tier": "write",
+                        "reason": "MCP alias test",
+                    },
+                },
+            },
+            self.config,
+            socket_requester=lambda s, p, t: (
+                seen_alias_mcp.append(p)
+                or {"status": "approved", "repo": "Locknes/lock-rip-site", "topic": "oob-write"}
+            ),
+        )
+        self.assertFalse(mcp_al_resp["result"]["isError"])
+        self.assertEqual(seen_alias_mcp[-1]["module"], "github_repo_tier")
+        self.assertEqual(seen_alias_mcp[-1]["params"]["oob_tier"], "write")
 
 
 if __name__ == "__main__":
