@@ -2,13 +2,15 @@
 GitHub Repository OOB Tier Promotion / Tightening Gate Module (`github_repo_tier`).
 
 Allows an unprivileged caller to request changing an existing GitHub repository's
-`oob-<tier>` policy topic (`oob-auth github-set-tier` / MCP `oob_github_set_tier`)
-strictly gated by Home Assistant mobile approval, preserving all non-policy topics
-and refusing to promote protected Tier-0 repositories (such as `ha-oob-gate`) to `oob-write`.
+`oob-<tier>` policy topic (`oob-auth github-set-tier` / `oob-auth github-repo-tier` /
+MCP `oob_github_set_tier`) strictly gated by Home Assistant mobile approval,
+preserving all non-policy topics, refusing to promote protected Tier-0 repositories
+(such as `ha-oob-gate`) to `oob-write`, and locking out `oob-deny` repositories by default.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any, Callable, Dict, List, Tuple, TypeVar
 
 from ..sanitize import sanitize_text
@@ -25,6 +27,22 @@ from .github_token import VALID_REPO_RE, _github_api_request, create_github_app_
 from .self_update import DEFAULT_SELF_UPDATE_REPO
 
 _T = TypeVar("_T")
+
+DENIED_POLICY_TOPICS = frozenset({"oob-deny", "oob-none", "agy-deny", "agy-none"})
+
+
+def _partition_topics(raw_names: List[Any]) -> Tuple[List[str], List[str]]:
+    prev_oob: List[str] = []
+    kept: List[str] = []
+    for raw in raw_names:
+        topic = str(raw).strip().lower()
+        if not topic:
+            continue
+        if topic in RESERVED_TOPICS or topic.startswith(RESERVED_TOPIC_PREFIXES):
+            prev_oob.append(topic)
+        else:
+            kept.append(topic)
+    return prev_oob, kept
 
 
 class GitHubRepoTierModule(BaseGateModule):
@@ -50,6 +68,7 @@ class GitHubRepoTierModule(BaseGateModule):
         if self_update_repo:
             protected.add(self_update_repo)
         cfg["protected_repos"] = protected
+        cfg["allow_unlock_denied_repos"] = bool(tier_cfg.get("allow_unlock_denied_repos", False))
         return cfg
 
     def _with_repo_admin_token(
@@ -81,6 +100,39 @@ class GitHubRepoTierModule(BaseGateModule):
             raise RuntimeError("Root GitHub user credential is not available")
         return fn(user_tok)
 
+    def _inspect_metadata_via_token_app(
+        self,
+        cfg: Dict[str, Any],
+        token_inst_id: str,
+        repo_full: str,
+        repo_name: str,
+    ) -> Tuple[int, Any, Any, Any]:
+        api_url = cfg["api_url"]
+        if not (cfg["token_app_id"] and os.path.isfile(cfg["token_private_key_path"])):
+            return 404, {}, {}, {}
+        tok_jwt = create_github_app_jwt(cfg["token_app_id"], private_key_path=cfg["token_private_key_path"])
+        code_t, tok_data = _github_api_request(
+            f"{api_url}/app/installations/{token_inst_id}/access_tokens",
+            tok_jwt,
+            method="POST",
+            payload={"repositories": [repo_name], "permissions": {"metadata": "read"}},
+        )
+        if code_t != 201 or not tok_data.get("token"):
+            return 404, {}, {}, {}
+        meta_tok = str(tok_data["token"])
+        try:
+            code_r, repo_info = _github_api_request(f"{api_url}/repos/{repo_full}", meta_tok, method="GET")
+            if code_r != 200 or not isinstance(repo_info, dict):
+                return code_r, repo_info, None, None
+            canonical = str(repo_info.get("full_name") or repo_full)
+            code_top, topics_resp = _github_api_request(f"{api_url}/repos/{canonical}/topics", meta_tok, method="GET")
+            code_prop, props_resp = _github_api_request(
+                f"{api_url}/repos/{canonical}/properties/values", meta_tok, method="GET"
+            )
+            return code_r, repo_info, (code_top, topics_resp), (code_prop, props_resp)
+        finally:
+            _github_api_request(f"{api_url}/installation/token", meta_tok, method="DELETE")
+
     def validate(self, params: Dict[str, Any], caller: CallerInfo, config: Dict[str, Any]) -> Tuple[bool, str]:
         repo_full = str(params.get("repo") or "").strip()
         if repo_full.endswith(".git"):
@@ -93,7 +145,7 @@ class GitHubRepoTierModule(BaseGateModule):
             return False, f"Invalid repository name '{repo_name}'"
         params["repo"] = repo_full
 
-        raw_tier = str(params.get("oob_tier") or "").strip().lower()
+        raw_tier = str(params.get("oob_tier") or params.get("tier") or "").strip().lower()
         if raw_tier not in ALLOWED_OOB_TIERS:
             return False, "oob_tier is required and must be one of: oob, read, write, deny"
         params["oob_tier"] = raw_tier
@@ -127,6 +179,7 @@ class GitHubRepoTierModule(BaseGateModule):
 
         owner_low = owner.lower()
         inst_info = creator_inst_map.get(owner_low)
+        token_inst_info = token_inst_map.get(owner_low)
         known_installs = creator_inst_map or token_inst_map
 
         if cfg["allowed_owners"] and owner_low not in cfg["allowed_owners"]:
@@ -157,19 +210,42 @@ class GitHubRepoTierModule(BaseGateModule):
 
         def inspect_repo(tok: str) -> Tuple[bool, str]:
             code_r, repo_info = _github_api_request(f"{api_url}/repos/{repo_full}", tok, method="GET")
+            topics_bundle: Any = None
+            props_bundle: Any = None
+            attach_creator_inst_id = ""
+
+            if (
+                code_r == 404
+                and auth_mode == "user_token"
+                and inst_info
+                and inst_info.get("repository_selection") == "selected"
+                and token_inst_info
+            ):
+                code_r, repo_info, topics_bundle, props_bundle = self._inspect_metadata_via_token_app(
+                    cfg, token_inst_info["id"], repo_full, repo_name
+                )
+                if code_r == 200 and isinstance(repo_info, dict):
+                    attach_creator_inst_id = inst_info["id"]
+
             if code_r == 404:
                 return False, f"Repository '{repo_full}' does not exist"
             if code_r != 200 or not isinstance(repo_info, dict):
                 return False, f"Unexpected HTTP {code_r} inspecting '{repo_full}'"
 
             canonical_full = str(repo_info.get("full_name") or repo_full)
-            code_t, topics_resp = _github_api_request(f"{api_url}/repos/{canonical_full}/topics", tok, method="GET")
+            if topics_bundle is not None:
+                code_t, topics_resp = topics_bundle
+            else:
+                code_t, topics_resp = _github_api_request(f"{api_url}/repos/{canonical_full}/topics", tok, method="GET")
             if code_t != 200 or not isinstance(topics_resp, dict):
                 return False, f"Failed reading repository topics for '{canonical_full}' (HTTP {code_t})"
 
-            prop_code, props_resp = _github_api_request(
-                f"{api_url}/repos/{canonical_full}/properties/values", tok, method="GET"
-            )
+            if props_bundle is not None:
+                prop_code, props_resp = props_bundle
+            else:
+                prop_code, props_resp = _github_api_request(
+                    f"{api_url}/repos/{canonical_full}/properties/values", tok, method="GET"
+                )
             if prop_code == 200 and isinstance(props_resp, list):
                 for item in props_resp:
                     if not isinstance(item, dict):
@@ -183,18 +259,24 @@ class GitHubRepoTierModule(BaseGateModule):
                             f"{pname}={pval!r}, which overrides repository topics",
                         )
 
-            current_topics = [str(t).strip().lower() for t in (topics_resp.get("names") or []) if str(t).strip()]
-            prev_oob: List[str] = []
-            kept: List[str] = []
-            for topic in current_topics:
-                if topic in RESERVED_TOPICS or topic.startswith(RESERVED_TOPIC_PREFIXES):
-                    prev_oob.append(topic)
-                else:
-                    kept.append(topic)
+            prev_oob, kept = _partition_topics(topics_resp.get("names") or [])
+            denied_found = [t for t in prev_oob if t in DENIED_POLICY_TOPICS]
+            if denied_found and not cfg["allow_unlock_denied_repos"]:
+                return (
+                    False,
+                    f"Security policy: repository '{canonical_full}' is locked with '{', '.join(denied_found)}' "
+                    "and must be unlocked manually in GitHub UI",
+                )
 
             params["repo"] = canonical_full
             params["_auth_mode"] = auth_mode
             params["_inst_id"] = inst_id
+            params["_attach_creator_inst_id"] = attach_creator_inst_id
+            if repo_info.get("id") is not None:
+                params["_repo_id"] = repo_info.get("id")
+            if token_inst_info:
+                params["_token_inst_id"] = token_inst_info["id"]
+                params["_token_inst_selection"] = token_inst_info["repository_selection"]
             params["_prev_oob_topics"] = prev_oob
             params["_kept_topics"] = kept
             return True, "ok"
@@ -269,11 +351,39 @@ class GitHubRepoTierModule(BaseGateModule):
         target_topic = f"oob-{oob_tier}"
         prev_oob = list(params.get("_prev_oob_topics") or [])
         kept = list(params.get("_kept_topics") or [])
-        new_topics = [target_topic, *[t for t in kept if t != target_topic]]
         auth_mode = str(params.get("_auth_mode") or "user_token")
         inst_id = str(params.get("_inst_id") or "")
+        repo_id = params.get("_repo_id")
+        attach_creator_inst_id = str(params.get("_attach_creator_inst_id") or "")
+        token_inst_id = str(params.get("_token_inst_id") or "")
+        token_inst_selection = str(params.get("_token_inst_selection") or "")
 
         def apply_topics(tok: str) -> Dict[str, Any]:
+            if auth_mode == "user_token" and attach_creator_inst_id and repo_id:
+                code_att, att_resp = _github_api_request(
+                    f"{api_url}/user/installations/{attach_creator_inst_id}/repositories/{repo_id}",
+                    tok,
+                    method="PUT",
+                )
+                if code_att not in (204, 304):
+                    msg = att_resp.get("message", "") if isinstance(att_resp, dict) else ""
+                    raise RuntimeError(
+                        f"Failed attaching repository '{repo_full}' to repo-creator GitHub App (HTTP {code_att}): {msg}"
+                    )
+
+            effective_prev_oob = prev_oob
+            effective_kept = kept
+            code_live, live_resp = _github_api_request(f"{api_url}/repos/{repo_full}/topics", tok, method="GET")
+            if code_live == 200 and isinstance(live_resp, dict):
+                live_prev, live_kept = _partition_topics(live_resp.get("names") or [])
+                if any(t in DENIED_POLICY_TOPICS for t in live_prev) and not cfg["allow_unlock_denied_repos"]:
+                    raise RuntimeError(
+                        f"Security policy: repository '{repo_full}' is locked with a deny topic; aborting tier change"
+                    )
+                effective_prev_oob = live_prev
+                effective_kept = live_kept
+
+            new_topics = [target_topic, *[t for t in effective_kept if t != target_topic]]
             code, resp = _github_api_request(
                 f"{api_url}/repos/{repo_full}/topics",
                 tok,
@@ -284,11 +394,26 @@ class GitHubRepoTierModule(BaseGateModule):
                 msg = resp.get("message", "") if isinstance(resp, dict) else ""
                 raise RuntimeError(f"Failed updating repository topics for '{repo_full}' (HTTP {code}): {msg}")
             applied = resp.get("names", new_topics) if isinstance(resp, dict) else new_topics
+
+            if (
+                oob_tier in ("oob", "read", "write")
+                and auth_mode == "user_token"
+                and token_inst_selection == "selected"
+                and token_inst_id
+                and repo_id
+                and token_inst_id != attach_creator_inst_id
+            ):
+                _github_api_request(
+                    f"{api_url}/user/installations/{token_inst_id}/repositories/{repo_id}",
+                    tok,
+                    method="PUT",
+                )
+
             return {
                 "repo": repo_full,
                 "oob_tier": oob_tier,
                 "topic": target_topic,
-                "previous_oob_topics": prev_oob,
+                "previous_oob_topics": effective_prev_oob,
                 "topics": applied,
             }
 

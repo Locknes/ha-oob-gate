@@ -82,7 +82,7 @@ TOKEN="$(oob-auth github-create-repo \
   --reason "Bootstrap new public blueprint repository")"
 ```
 
-Promote or tighten a repository's OOB access tier (`oob-oob`, `oob-read`, `oob-write`, `oob-deny`) under explicit mobile approval (preserves non-policy topics; rejects Tier-0 protected repos such as `ha-oob-gate` from promotion to `oob-write`):
+Promote or tighten a repository's OOB access tier (`oob-oob`, `oob-read`, `oob-write`, `oob-deny`) under explicit mobile approval (preserves live non-policy topics, locks `oob-deny` repos against OOB unlock by default, and rejects Tier-0 protected repos such as `ha-oob-gate` from promotion to `oob-write`; `github-repo-tier` and `--tier` work as aliases):
 
 ```bash
 oob-auth github-set-tier \

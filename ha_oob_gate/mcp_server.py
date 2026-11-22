@@ -120,16 +120,17 @@ MCP_TOOLS: List[Dict[str, Any]] = [
         "description": (
             "Promote or tighten an existing GitHub repository's `oob-<tier>` topic (`oob`, `read`, `write`, `deny`) "
             "gated strictly by Home Assistant mobile approval, while preserving non-policy topics and blocking "
-            "Tier-0 protected repos from promotion to `oob-write`."
+            "Tier-0 protected or `oob-deny` repos."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo": {"type": "string", "description": "Target repository in 'owner/repo' format"},
                 "oob_tier": {"type": "string", "enum": ["oob", "read", "write", "deny"]},
+                "tier": {"type": "string", "enum": ["oob", "read", "write", "deny"], "description": "Alias for oob_tier"},
                 "reason": {"type": "string", "description": "Reason for changing this repository's OOB tier"},
             },
-            "required": ["repo", "oob_tier", "reason"],
+            "required": ["repo", "reason"],
         },
     },
     {
@@ -296,6 +297,12 @@ def dispatch_mcp_tool_call(
                 "isError": True,
             }
 
+    tier_params = {
+        "repo": arguments.get("repo", ""),
+        "oob_tier": arguments.get("oob_tier") or arguments.get("tier") or "",
+        "reason": arguments.get("reason", ""),
+    }
+
     module_map = {
         "oob_sudo_batch": (
             "sudo_batch",
@@ -323,14 +330,6 @@ def dispatch_mcp_tool_call(
                 "reason": arguments.get("reason", ""),
             },
         ),
-        "oob_github_set_tier": (
-            "github_repo_tier",
-            {
-                "repo": arguments.get("repo", ""),
-                "oob_tier": arguments.get("oob_tier", ""),
-                "reason": arguments.get("reason", ""),
-            },
-        ),
         "oob_github_create_repo": (
             "github_repo_create",
             {
@@ -344,14 +343,8 @@ def dispatch_mcp_tool_call(
                 "reason": arguments.get("reason", ""),
             },
         ),
-        "oob_github_set_tier": (
-            "github_repo_tier",
-            {
-                "repo": arguments.get("repo", ""),
-                "oob_tier": arguments.get("oob_tier", ""),
-                "reason": arguments.get("reason", ""),
-            },
-        ),
+        "oob_github_set_tier": ("github_repo_tier", tier_params),
+        "oob_github_repo_tier": ("github_repo_tier", tier_params),
         "oob_ha_api": (
             "ha_api",
             {

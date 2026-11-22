@@ -230,8 +230,10 @@ def update_github_repo_creator_config(
         cfg = {}
 
     enabled = cfg.get("enabled_modules")
-    if isinstance(enabled, list) and "github_repo_create" not in enabled:
-        enabled.append("github_repo_create")
+    if isinstance(enabled, list):
+        for req_mod in ("github_repo_create", "github_repo_tier"):
+            if req_mod not in enabled:
+                enabled.append(req_mod)
         cfg["enabled_modules"] = enabled
 
     mod_cfg = cfg.setdefault("module_config", {})

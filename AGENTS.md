@@ -8,6 +8,8 @@ This repository provides **Out-of-Band (OOB) Authorization (`ha-oob-gate`)** for
    - `oob_sudo_batch(script, reason, cwd?)` — Execute a SHA-256-pinned bash script snapshot as `root` (`UID 0`) after human mobile approval, with mount-namespace/systemd self-tamper and mutable-path guardrails.
    - `oob_k8s_token(namespaces, reason, role?)` — Acquire a 30-minute namespace-scoped Kubernetes JWT.
    - `oob_github_token(repo, reason, permission?)` — Acquire a 1-hour single-repo GitHub token.
+   - `oob_github_create_repo(repo, reason, visibility?, description?, oob_tier?, topics?, mint_token?, workflows?)` — Create a new GitHub repository under mobile approval (`oob-oob` default).
+   - `oob_github_set_tier(repo, oob_tier, reason)` — Promote or tighten a repository's `oob-<tier>` topic under mobile approval (blocks Tier-0 `protected_repos` from `oob-write` and locks `oob-deny` repos; `github-repo-tier` CLI alias supported).
    - `oob_ha_api(reason, mode?, scope?, domains?, method?, path?, body?)` — Request a single filtered Home Assistant REST API proxy call (`mode="single"`) or a 15-minute proxy lease (`mode="lease"`).
    - `oob_ha_api_call(request_id, caller_nonce, path, method?, body?)` — Execute subsequent filtered Home Assistant API calls against an active `oob_ha_api` lease (`mode="lease"`) without re-prompting.
    - `oob_secret_checkout(key, reason)` — Check out a named secret from `/etc/ha-sudo/vault.json`.

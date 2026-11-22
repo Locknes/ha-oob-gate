@@ -16,7 +16,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from ha_oob_gate.daemon import GateEngine
-from ha_oob_gate.modules import CallerInfo
+from ha_oob_gate.modules import CallerInfo, discover_modules
 
 
 class TestGitHubRepoTierModule(unittest.TestCase):
@@ -184,6 +184,121 @@ class TestGitHubRepoTierModule(unittest.TestCase):
         self.assertEqual(granted["topics"], ["oob-write", "gitops", "fleet"])
         del_calls = [c for c in calls if c[0] == "DELETE" and c[1].endswith("/installation/token")]
         self.assertEqual(len(del_calls), 2, "Expected temporary org admin tokens revoked after both validate and grant")
+
+    def test_discover_modules_co_enables_github_repo_tier_with_github_repo_create(self) -> None:
+        mods_with_create = discover_modules(["github_repo_create"])
+        self.assertIn("github_repo_create", mods_with_create)
+        self.assertIn("github_repo_tier", mods_with_create)
+
+        mods_confirm_only = discover_modules(["generic_confirm"])
+        self.assertIn("generic_confirm", mods_confirm_only)
+        self.assertNotIn("github_repo_tier", mods_confirm_only)
+
+    def test_oob_deny_lockout_and_live_topic_merge_toctou_protection(self) -> None:
+        mod = self.engine.modules["github_repo_tier"]
+        topic_seq = [
+            ["oob-deny", "sensitive"],
+            ["agy-deny", "sensitive"],
+            ["oob-oob", "alpha"],
+            ["oob-deny", "alpha", "beta"],
+            ["oob-oob", "alpha"],
+            ["oob-oob", "alpha", "beta"],
+        ]
+
+        def fake_gh(url, token, method="GET", payload=None):
+            if url.endswith("/app/installations"):
+                return 200, [{"id": 102, "repository_selection": "all", "account": {"login": "locklabs", "type": "Organization"}}]
+            if url.endswith("/app/installations/102/access_tokens"):
+                return 201, {"token": "ghs_temp_org_admin"}
+            if url.endswith("/installation/token") and method == "DELETE":
+                return 204, {}
+            if url.endswith("/repos/locklabs/locked-repo") and method == "GET":
+                return 200, {"id": 901, "full_name": "locklabs/locked-repo"}
+            if url.endswith("/repos/locklabs/locked-repo/topics") and method == "GET":
+                return 200, {"names": topic_seq.pop(0)}
+            if url.endswith("/repos/locklabs/locked-repo/properties/values"):
+                return 404, {}
+            if url.endswith("/repos/locklabs/locked-repo/topics") and method == "PUT":
+                return 200, {"names": payload["names"]}
+            return 500, {}
+
+        with patch("ha_oob_gate.modules.github_repo_create.create_github_app_jwt", return_value="fake.jwt"), \
+             patch("ha_oob_gate.modules.github_repo_tier.create_github_app_jwt", return_value="fake.jwt"), \
+             patch("ha_oob_gate.modules.github_repo_create._github_api_request", side_effect=fake_gh), \
+             patch("ha_oob_gate.modules.github_repo_tier._github_api_request", side_effect=fake_gh):
+            for lock_tag in ("oob-deny", "agy-deny"):
+                ok_d, err_d = mod.validate(
+                    {"repo": "locklabs/locked-repo", "oob_tier": "write", "reason": "Try unlock"},
+                    self.caller,
+                    self.config,
+                )
+                self.assertFalse(ok_d)
+                self.assertIn(lock_tag, err_d)
+
+            # Concurrent lock between validate() and grant() aborts before PUT
+            p_toctou = {"repo": "locklabs/locked-repo", "oob_tier": "write", "reason": "TOCTOU test"}
+            ok_v, msg_v = mod.validate(p_toctou, self.caller, self.config)
+            self.assertTrue(ok_v, msg_v)
+            with self.assertRaises(RuntimeError) as cm_err:
+                mod.grant("req-toctou", p_toctou, self.caller, 600, self.config)
+            self.assertIn("deny topic", str(cm_err.exception))
+
+            # Concurrent non-policy topic (`beta`) added between validate and grant is preserved
+            p_merge = {"repo": "locklabs/locked-repo", "oob_tier": "write", "reason": "Live topic merge"}
+            ok_m, msg_m = mod.validate(p_merge, self.caller, self.config)
+            self.assertTrue(ok_m, msg_m)
+            res = mod.grant("req-merge", p_merge, self.caller, 600, self.config)
+            self.assertEqual(res["topics"], ["oob-write", "alpha", "beta"])
+
+    def test_selected_repo_creator_private_repo_fallback_and_attach_on_grant(self) -> None:
+        import json
+
+        with open(self.oauth_path, "w", encoding="utf-8") as f:
+            json.dump({"client_id": "Iv123", "access_token": "ghu_root_user_oauth"}, f)
+
+        calls = []
+
+        def fake_gh(url, token, method="GET", payload=None):
+            calls.append((method, url, token, payload))
+            if url.endswith("/app/installations"):
+                return 200, [
+                    {"id": 201, "repository_selection": "selected", "account": {"login": "Locknes", "type": "User"}}
+                ]
+            if url.endswith("/app/installations/201/access_tokens"):
+                return 201, {"token": "ghs_meta_fallback"}
+            if url.endswith("/installation/token") and method == "DELETE":
+                return 204, {}
+            if url.endswith("/repos/Locknes/lock-rip-site") and method == "GET":
+                if token == "ghu_root_user_oauth":
+                    return 404, {"message": "Not Found"}
+                return 200, {"id": 88801, "full_name": "Locknes/lock-rip-site"}
+            if url.endswith("/repos/Locknes/lock-rip-site/topics") and method == "GET":
+                return 200, {"names": ["oob-oob", "cloudflare-pages", "static-site"]}
+            if url.endswith("/repos/Locknes/lock-rip-site/properties/values"):
+                return 404, {}
+            if url.endswith("/user/installations/201/repositories/88801") and method == "PUT":
+                return 204, {}
+            if url.endswith("/repos/Locknes/lock-rip-site/topics") and method == "PUT":
+                return 200, {"names": payload["names"]}
+            return 500, {}
+
+        mod = self.engine.modules["github_repo_tier"]
+        params = {"repo": "Locknes/lock-rip-site", "tier": "write", "reason": "Enable auto-pushes"}
+        with patch("ha_oob_gate.modules.github_repo_create.create_github_app_jwt", return_value="fake.jwt"), \
+             patch("ha_oob_gate.modules.github_repo_tier.create_github_app_jwt", return_value="fake.jwt"), \
+             patch("ha_oob_gate.modules.github_repo_create._github_api_request", side_effect=fake_gh), \
+             patch("ha_oob_gate.modules.github_repo_tier._github_api_request", side_effect=fake_gh):
+            ok, msg = mod.validate(params, self.caller, self.config)
+            self.assertTrue(ok, msg)
+            self.assertEqual(params["_attach_creator_inst_id"], "201")
+            res = mod.grant("req-priv", params, self.caller, 600, self.config)
+
+        self.assertEqual(res["topics"], ["oob-write", "cloudflare-pages", "static-site"])
+        self.assertIn(
+            ("PUT", "https://api.github.com/user/installations/201/repositories/88801", "ghu_root_user_oauth", None),
+            calls,
+        )
+        self.assertIn(("DELETE", "https://api.github.com/installation/token", "ghs_meta_fallback", None), calls)
 
 
 if __name__ == "__main__":
